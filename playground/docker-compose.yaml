@@ -1,0 +1,45 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+version: "3.3"
+
+services:
+  local-flex:
+    image: ${PDK_TEST_FLEX_IMAGE_NAME:-mulesoft/flex-gateway}:${PDK_TEST_FLEX_IMAGE_VERSION:-1.13.0}
+    ports:
+      - 8081:8081
+    volumes:
+      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+  backend:
+    image: kennethreitz/httpbin
+  cdgclogin:
+    image: python:3.12-alpine
+    environment:
+      ROLE: cdgclogin
+      PORT: "80"
+    volumes:
+      - ./mocks/mock_server.py:/mock_server.py:ro
+    command: python /mock_server.py
+  cdgcapi:
+    image: python:3.12-alpine
+    environment:
+      ROLE: cdgcapi
+      PORT: "80"
+      DQ_SCORE: "95"
+    volumes:
+      - ./mocks/mock_server.py:/mock_server.py:ro
+    command: python /mock_server.py
+  objectstoreauth:
+    image: python:3.12-alpine
+    environment:
+      ROLE: objectstoreauth
+      PORT: "80"
+    volumes:
+      - ./mocks/mock_server.py:/mock_server.py:ro
+    command: python /mock_server.py
+  objectstore:
+    image: python:3.12-alpine
+    environment:
+      ROLE: objectstore
+      PORT: "80"
+    volumes:
+      - ./mocks/mock_server.py:/mock_server.py:ro
+    command: python /mock_server.py

@@ -1,0 +1,134 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: dq-gate-policy
+    category: Custom
+    description: >-
+      Policy gates agent/MCP tool calls on a CDGC-governed asset's current data
+      quality score, warning or blocking requests when quality drops below
+      configurable thresholds. The score is cached in a MuleSoft Object Store with
+      a long TTL (CDGC DQ scans run roughly daily) and refreshed lazily, inline, by
+      whichever request happens to see a stale cache entry — so almost every
+      request is a fast Object Store read, not a live CDGC call.
+    metadata/capabilities/injectionPoint: inbound
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    cdgcLoginUrl:
+      type: string
+      format: service
+      description: >-
+        IDMC login base URL for this org, e.g. https://dmp-us.informaticacloud.com.
+        Region/POD prefix (dm- vs dmp-) is org-specific — do not assume, verify per org.
+    cdgcBaseApiUrl:
+      type: string
+      format: service
+      description: >-
+        CDGC base API URL for this org, e.g. https://idmc-api.dmp-us.informaticacloud.com.
+        Not reliably returned by the Login API response in all orgs — configure explicitly.
+    cdgcOrgUsername:
+      type: string
+      description: IDMC service-account username used to authenticate to CDGC.
+    cdgcOrgPassword:
+      type: string
+      description: IDMC service-account password.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    cdgcAssetId:
+      type: string
+      description: >-
+        Internal ID of the single CDGC asset this policy instance monitors
+        (same ID shown in the CDGC UI's asset URL).
+    warnThreshold:
+      type: number
+      minimum: 0
+      maximum: 100
+      default: 90
+      description: >-
+        If the asset's current DQ score is below this value (and at or above
+        blockThreshold), the request is allowed through but flagged with a warning.
+    blockThreshold:
+      type: number
+      minimum: 0
+      maximum: 100
+      default: 70
+      description: >-
+        If the asset's current DQ score is below this value, the request is
+        rejected before it reaches the upstream MCP server.
+    scoreAggregation:
+      type: string
+      default: min
+      enum:
+        - min
+        - average
+      description: >-
+        How to combine multiple DQ dimensions (Completeness, Validity, Accuracy, ...)
+        returned for the asset into the single score compared against thresholds.
+        min is the conservative default — the worst dimension gates the request.
+    refreshIntervalSeconds:
+      type: integer
+      default: 86400
+      minimum: 30
+      description: >-
+        Cache TTL for the asset's DQ score. A request only re-authenticates to CDGC and
+        refreshes the cached score (fresh Login+JWT, no token caching/refresh logic) if
+        the cached entry is older than this. CDGC DQ scans run roughly daily, so 24h
+        (the default) is a reasonable real-world value, not just a demo shortcut.
+    failOpenOnCdgcError:
+      type: boolean
+      default: true
+      description: >-
+        If a stale-cache request's inline CDGC fetch fails (timeout, auth failure, 5xx),
+        keep serving the last known-good cached score when true. If false, treat a fetch
+        failure as if the score were unknown and apply blockOnUnknownScore behavior instead.
+    blockOnUnknownScore:
+      type: boolean
+      default: false
+      description: >-
+        Whether to block requests when no cached score is available yet (e.g. right
+        after a fresh policy/worker start, before the first periodic fetch completes,
+        or after a failOpenOnCdgcError=false failure). Default is fail-open (pass through).
+    objectStoreAuthUrl:
+      type: string
+      format: service
+      description: "Complete OAuth token endpoint URL, e.g. https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token."
+    objectStoreUrl:
+      type: string
+      format: service
+      description: "Object Store V2 host URL, e.g. https://object-store-us-west-2.anypoint.mulesoft.com."
+    objectStoreClientId:
+      type: string
+      description: OAuth2 client ID for authenticating with the Object Store service.
+    objectStoreClientSecret:
+      type: string
+      description: OAuth2 client secret for authenticating with the Object Store service.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    objectStoreName:
+      type: string
+      default: dq-gate-store
+      description: Name of the Object Store used to persist the cached DQ score.
+    timeout:
+      type: integer
+      default: 60000
+      description: Timeout in milliseconds for CDGC (Login/JWT/score) and Object Store HTTP requests.
+  required:
+    - cdgcLoginUrl
+    - cdgcBaseApiUrl
+    - cdgcOrgUsername
+    - cdgcOrgPassword
+    - cdgcAssetId
+    - warnThreshold
+    - blockThreshold
+    - objectStoreAuthUrl
+    - objectStoreUrl
+    - objectStoreClientId
+    - objectStoreClientSecret
+    - objectStoreName
