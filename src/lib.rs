@@ -39,7 +39,21 @@ const SCORE_STORE_MIN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
 /// a small count is enough (see `pdk-distributed-cache-gossip`).
 const CAS_MAX_RETRIES: u32 = 3;
 
-const DEFAULT_TIMEOUT_MS: i64 = 60_000;
+/// Per-call timeout (ms) for a single CDGC HTTP request (Login, JWT, or Detail). Deliberately small
+/// (5s) because a cache-miss/refresh request performs these three calls *inline* on the agent's
+/// request hot path -- see [`CDGC_REFRESH_BUDGET_MS`]. Overridable via the `timeout` config
+/// property, but the per-call value is additionally clamped to the remaining overall budget.
+const DEFAULT_TIMEOUT_MS: i64 = 5_000;
+/// Overall hot-path latency cap (ms) for the *entire* inline CDGC refresh chain (Login -> JWT ->
+/// Detail) on a single cache-miss request. The refresh model is deliberately inline (the triggering
+/// request pays for the refresh) -- a background `Timer` refresher was considered and rejected for
+/// this iteration to avoid a separate scheduler and its own failure/observability surface (#9). The
+/// cost is *bounded* rather than moved: each of the three chained calls is capped at the budget
+/// still remaining, so total blocking can never exceed this cap. When the budget is exhausted the
+/// refresh aborts and the caller falls back to the configured unknown-score posture (serve
+/// last-known-good under `failOpenOnCdgcError=true`, else apply `blockOnUnknownScore`), instead of
+/// the previous ~180s worst case (three 60s calls).
+const CDGC_REFRESH_BUDGET_MS: i64 = 10_000;
 const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
 const CDGC_JWT_NONCE: &str = "1234";
 /// JSON-RPC error code returned when a request is blocked. Chosen from the JSON-RPC 2.0
@@ -125,8 +139,27 @@ enum DqGateData {
     Evaluated { score: Option<f64>, status: &'static str },
 }
 
-fn timeout(config: &Config) -> Duration {
-    Duration::from_millis(config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS).max(0) as u64)
+/// Milliseconds elapsed between two [`SystemTime`] readings from the injected [`Clock`], clamped at
+/// zero if the clock appears to go backwards. Used to track how much of [`CDGC_REFRESH_BUDGET_MS`]
+/// the inline refresh chain has already consumed.
+fn elapsed_ms(start: SystemTime, now: SystemTime) -> i64 {
+    now.duration_since(start)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Effective timeout for the *next* CDGC call on the inline refresh hot path: the configured
+/// per-call timeout (`per_call_ms`) clamped to the overall refresh budget still remaining after
+/// `elapsed_ms`. This is what enforces [`CDGC_REFRESH_BUDGET_MS`] across the three chained calls --
+/// no single call may block past the remaining budget, so their sum is bounded. Returns `None` once
+/// the budget is exhausted, signalling the caller to abort the refresh and fall back to the
+/// unknown-score posture.
+fn next_call_timeout(per_call_ms: i64, elapsed_ms: i64) -> Option<Duration> {
+    let remaining = CDGC_REFRESH_BUDGET_MS - elapsed_ms;
+    if remaining <= 0 {
+        return None;
+    }
+    Some(Duration::from_millis(remaining.min(per_call_ms.max(0)) as u64))
 }
 
 fn unix_seconds(time: SystemTime) -> i64 {
@@ -340,18 +373,30 @@ async fn try_acquire_refresh_lock<S: DataStorage>(
 /// Runs the live CDGC sequence (Login -> JWT -> Detail API `dataQuality` segment) and aggregates
 /// the result into a single score. A fresh Login+JWT is performed every call, on purpose -- see
 /// the design doc's "Token strategy" decision -- since this only runs on a stale-cache request.
-async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
+///
+/// The three calls run inline on the request hot path, so the whole chain is bounded by
+/// [`CDGC_REFRESH_BUDGET_MS`]: `start` is stamped from the injected [`Clock`] and each call's
+/// timeout is clamped (via [`next_call_timeout`]) to the budget still remaining. If the budget is
+/// exhausted before a call, the refresh aborts with an error and the caller applies the
+/// unknown-score fallback -- the request never blocks unbounded (#9).
+async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -> Result<f64> {
+    let start = clock.now();
+    let per_call_ms = config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
+
     let login_body = serde_json::to_vec(&serde_json::json!({
         "username": config.cdgc_org_username,
         "password": config.cdgc_org_password,
     }))?;
 
+    let login_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
+        anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before Login")
+    })?;
     let login_response = client
         .request(&config.cdgc_login_url)
         .path("/identity-service/api/v1/Login")
         .headers(vec![("Content-Type", "application/json")])
         .body(&login_body)
-        .timeout(timeout(config))
+        .timeout(login_timeout)
         .post()
         .await
         .map_err(|err| anyhow!("CDGC login failed: {err}"))?;
@@ -367,6 +412,9 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
 
     let jwt_path = format!("/identity-service/api/v1/jwt/Token?client_id=idmc_api&nonce={CDGC_JWT_NONCE}");
     let cookie = format!("USER_SESSION={}", login.session_id);
+    let jwt_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
+        anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before JWT fetch")
+    })?;
     let jwt_response = client
         .request(&config.cdgc_login_url)
         .path(&jwt_path)
@@ -374,7 +422,7 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
             ("cookie", cookie.as_str()),
             ("IDS-SESSION-ID", login.session_id.as_str()),
         ])
-        .timeout(timeout(config))
+        .timeout(jwt_timeout)
         .get()
         .await
         .map_err(|err| anyhow!("CDGC JWT fetch failed: {err}"))?;
@@ -391,6 +439,9 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
         config.cdgc_asset_id
     );
     let authorization = format!("Bearer {}", jwt.jwt_token);
+    let detail_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
+        anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before Detail fetch")
+    })?;
     let detail_response = client
         .request(&config.cdgc_base_api_url)
         .path(&detail_path)
@@ -399,7 +450,7 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
             ("X-INFA-ORG-ID", login.org_id.as_str()),
             ("Content-Type", "application/json"),
         ])
-        .timeout(timeout(config))
+        .timeout(detail_timeout)
         .get()
         .await
         .map_err(|err| anyhow!("CDGC DQ score fetch failed: {err}"))?;
@@ -475,7 +526,7 @@ async fn resolve_score<S: DataStorage>(
         return cached.map(|cached| cached.score);
     }
 
-    match fetch_cdgc_score(client, config).await {
+    match fetch_cdgc_score(client, config, clock).await {
         Ok(score) => {
             logger::info!(
                 "Fetched fresh DQ score from CDGC for asset '{}': {score:.2}",
@@ -672,6 +723,7 @@ mod test {
     use std::collections::HashMap;
     use std::rc::Rc;
     use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
 
     use pdk::data_storage::{DataStorage, DataStorageError, StoreMode};
     use pdk_unit::{TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
@@ -1223,5 +1275,41 @@ mod test {
         // Two different assets must not share a lock.
         assert_eq!(block_on(super::try_acquire_refresh_lock(&store, "dq-refresh-lock-a", 1)).unwrap(), true);
         assert_eq!(block_on(super::try_acquire_refresh_lock(&store, "dq-refresh-lock-b", 1)).unwrap(), true);
+    }
+
+    // --- #9 latency-budget helper tests ---
+
+    #[test]
+    fn elapsed_ms_is_monotonic_and_floors_at_zero() {
+        let start = SystemTime::UNIX_EPOCH;
+        let later = start + Duration::from_millis(1_500);
+        assert_eq!(super::elapsed_ms(start, later), 1_500);
+        // A clock that appears to go backwards must never yield a negative elapsed.
+        assert_eq!(super::elapsed_ms(later, start), 0);
+        assert_eq!(super::elapsed_ms(start, start), 0);
+    }
+
+    #[test]
+    fn next_call_timeout_clamps_per_call_to_remaining_budget() {
+        let budget = super::CDGC_REFRESH_BUDGET_MS; // 10_000
+        let per_call = super::DEFAULT_TIMEOUT_MS; // 5_000
+
+        // Fresh start: the per-call timeout (smaller than the budget) is used as-is.
+        assert_eq!(super::next_call_timeout(per_call, 0), Some(Duration::from_millis(5_000)));
+
+        // Late in the chain: only the remaining budget is granted, below the per-call ceiling.
+        assert_eq!(super::next_call_timeout(per_call, budget - 500), Some(Duration::from_millis(500)));
+
+        // A per-call value smaller than the remaining budget wins (min of the two).
+        assert_eq!(super::next_call_timeout(2_000, 0), Some(Duration::from_millis(2_000)));
+    }
+
+    #[test]
+    fn next_call_timeout_aborts_when_budget_exhausted() {
+        let budget = super::CDGC_REFRESH_BUDGET_MS;
+        // Exactly at the budget: nothing left, abort the refresh.
+        assert_eq!(super::next_call_timeout(super::DEFAULT_TIMEOUT_MS, budget), None);
+        // Past the budget: also abort (no unbounded blocking).
+        assert_eq!(super::next_call_timeout(super::DEFAULT_TIMEOUT_MS, budget + 5_000), None);
     }
 }

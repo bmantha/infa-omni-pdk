@@ -116,8 +116,13 @@ spec:
         cache and refreshes independently.
     timeout:
       type: integer
-      default: 60000
-      description: Timeout in milliseconds for CDGC Login/JWT/Detail HTTP requests.
+      default: 5000
+      description: >-
+        Per-call timeout in milliseconds for each CDGC HTTP request (Login, JWT, Detail). Because a
+        cache-miss request performs all three inline on the hot path, each call is additionally
+        clamped to the remaining overall refresh budget (a fixed ~10s cap on the whole chain); if
+        that budget is exhausted the refresh aborts and the unknown-score posture applies, rather
+        than blocking the agent's call unbounded.
   required:
     - cdgcLoginUrl
     - cdgcBaseApiUrl

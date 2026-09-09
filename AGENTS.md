@@ -85,6 +85,25 @@ Always tell the user *which* property or connector was blocked and that the DQ G
 
 `playground/demo.sh` exists for a self-contained Docker-based demo (two isolated Flex stacks, same contrast), but for a quick Claude Desktop demo the MCP connectors above are sufficient.
 
+## CDGC fetch latency: inline refresh + bounded budget
+
+The DQ score is refreshed **inline** — the cache-miss request that wins the refresh lock performs the
+CDGC Login → JWT → Detail chain itself, on the agent's request hot path. A background `Timer`-based
+refresher was considered and **deliberately rejected** for this iteration: it adds a separate
+scheduler with its own failure and observability surface. Inline keeps the model simple; the cost is
+**bounded, not moved**.
+
+- **Per-call timeout** (`timeout`, default 5000 ms) caps each single CDGC HTTP call.
+- **Overall refresh budget** (`CDGC_REFRESH_BUDGET_MS`, ~10s) caps the *whole* three-call chain: each
+  call's effective timeout is clamped to the budget still remaining (`next_call_timeout`), so total
+  blocking can never exceed the cap. This replaced the previous ~180s worst case (three 60s calls).
+- When the budget is exhausted the refresh **aborts** and the request falls back to the configured
+  unknown-score posture — serve last-known-good under `failOpenOnCdgcError=true`, otherwise apply
+  `blockOnUnknownScore`. The agent's call is never blocked unbounded.
+
+Time is read via the injected PDK `Clock` (`clock.now()`), never `SystemTime::now()`, so it is
+host-sourced and testable.
+
 ## Resources
 
 - PDK documentation — https://docs.mulesoft.com/pdk/latest/
