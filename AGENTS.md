@@ -85,6 +85,42 @@ Always tell the user *which* property or connector was blocked and that the DQ G
 
 `playground/demo.sh` exists for a self-contained Docker-based demo (two isolated Flex stacks, same contrast), but for a quick Claude Desktop demo the MCP connectors above are sufficient.
 
+## Fail-open vs fail-closed posture (a security decision)
+
+How the gate behaves when it *cannot* obtain a trustworthy score is a security decision, surfaced
+through two **orthogonal** config knobs — do not conflate them:
+
+| Situation | Knob | Default | Behavior on default |
+|---|---|---|---|
+| **No score at all** — cold worker start before the first fetch, or a `failOpenOnCdgcError=false` failure with an empty cache | `blockOnUnknownScore` | `true` (fail-**closed**) | Block the request (JSON-RPC `-32008`) |
+| **Transient CDGC error** on an asset whose score is *already* cached | `failOpenOnCdgcError` | `true` (fail-**open** on cache) | Serve the last-known-good cached score |
+
+- **`blockOnUnknownScore` defaults fail-CLOSED.** The gate blocks rather than silently passing
+  ungated traffic during exactly the windows an operator is least likely to notice (startup, a CDGC
+  outage with a cold cache). Setting it `false` is a deliberate **soft launch**: unknown-score
+  traffic passes through ungated with `x-dq-gate-status: unknown`, and a **one-shot per-worker
+  warning** (`UNGATED_BYPASS_LOGGED`) marks the window during which the control is disabled — enough
+  to be observable in the logs without flooding them.
+- **`failOpenOnCdgcError` governs a different case:** a *transient* refresh failure when a
+  last-known-good score already exists. `true` keeps serving the cached score; `false` treats the
+  failure as an unknown score and defers to `blockOnUnknownScore`. It never applies when there is no
+  cached score to fall back to.
+
+### Denials surface as PolicyViolations
+
+Every **block** path calls `violations.generate_policy_violation()` immediately before its
+`Flow::Break`, so denials appear in **Anypoint Monitoring** (see `pdk-policy-violations`). Note:
+
+- A `PolicyViolation` does **not** itself reject the request — it is telemetry. The rejection is the
+  paired `Flow::Break(block_response(...))`. Both are always emitted together on a block.
+- The `PolicyViolation` object carries only the policy name/type (the PDK API exposes no custom
+  fields), so the **asset id, score, and threshold live in the correlated `warn!` log** on the same
+  path, not on the violation object.
+- **Pass-through paths emit no violation** — a soft-launch bypass, a warn-level score, and an
+  exempt/non-MCP request are all allowed, so none is a denial. (Empirically verified in the unit
+  tests: a `Flow::Break` response carries the request-context violation through to
+  `response.violation()`, while a `Flow::Continue` response reports `None`.)
+
 ## CDGC fetch latency: inline refresh + bounded budget
 
 The DQ score is refreshed **inline** — the cache-miss request that wins the refresh lock performs the

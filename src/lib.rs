@@ -8,6 +8,7 @@ use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, Store
 use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
+use pdk::policy_violation::PolicyViolations;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -581,6 +582,14 @@ async fn resolve_score<S: DataStorage>(
     }
 }
 
+thread_local! {
+    /// One-shot guard so the "gate is passing traffic UNGATED" warning fires only the first time a
+    /// bypass happens on this worker -- enough to make the fail-open window observable in the logs
+    /// without flooding them on every subsequent request (#10). Per-worker (thread-local) state is
+    /// the sanctioned way to hold process-wide flags in the single-threaded proxy-wasm model.
+    static UNGATED_BYPASS_LOGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 async fn request_filter<S: DataStorage>(
     request_state: RequestState,
     config: &Config,
@@ -588,6 +597,7 @@ async fn request_filter<S: DataStorage>(
     score_store: &S,
     lock_store: &S,
     clock: &Clock,
+    violations: &PolicyViolations,
 ) -> Flow<DqGateData> {
     // Atomically buffer request headers AND body before deciding. The split
     // into_headers_state() -> into_body_state() path releases headers to Envoy's router, which
@@ -652,14 +662,31 @@ async fn request_filter<S: DataStorage>(
 
     match score {
         None => {
-            if config.block_on_unknown_score.unwrap_or(false) {
+            // Default fail-CLOSED (blockOnUnknownScore defaults true, #10): with no score at all
+            // -- cold worker start, or a failOpenOnCdgcError=false failure with an empty cache --
+            // the gate blocks rather than silently disabling itself during the windows an operator
+            // is least likely to notice. Operators may opt into a soft launch by setting it false.
+            if config.block_on_unknown_score.unwrap_or(true) {
                 logger::warn!(
-                    "Blocking request: no DQ score available yet for asset '{}'",
+                    "Blocking request: no DQ score available yet for asset '{}' (fail-closed; blockOnUnknownScore=true)",
                     config.cdgc_asset_id
                 );
+                // Surface the denial to Anypoint Monitoring. The PolicyViolation object itself only
+                // carries the policy name/type (the API exposes no custom fields), so the asset id
+                // and threshold live in the correlated warn log above.
+                violations.generate_policy_violation();
                 Flow::Break(block_response(rpc_id, None, config))
             } else {
-                logger::warn!(
+                // Soft-launch bypass: passing traffic UNGATED. Warn ONCE per worker so the window
+                // during which the control is disabled is observable without flooding the logs.
+                let first_bypass = UNGATED_BYPASS_LOGGED.with(|logged| !logged.replace(true));
+                if first_bypass {
+                    logger::warn!(
+                        "DQ Gate BYPASS: passing traffic UNGATED for asset '{}' -- no DQ score is available and blockOnUnknownScore=false, so the data-quality control is currently disabled for this asset. (Warned once per worker.)",
+                        config.cdgc_asset_id
+                    );
+                }
+                logger::debug!(
                     "No DQ score available yet for asset '{}'; passing through per blockOnUnknownScore=false",
                     config.cdgc_asset_id
                 );
@@ -672,6 +699,8 @@ async fn request_filter<S: DataStorage>(
                 config.cdgc_asset_id,
                 config.block_threshold
             );
+            // Denial telemetry (see note above): score/threshold/asset id are in the warn log.
+            violations.generate_policy_violation();
             Flow::Break(block_response(rpc_id, Some(score), config))
         }
         Some(score) if score < config.warn_threshold => {
@@ -713,9 +742,12 @@ async fn launch_policy<S: DataStorage>(
     score_store: &S,
     lock_store: &S,
     clock: &Clock,
+    violations: &PolicyViolations,
 ) -> Result<()> {
-    let filter = on_request(|rs| request_filter(rs, config, client, score_store, lock_store, clock))
-        .on_response(response_filter);
+    let filter = on_request(|rs| {
+        request_filter(rs, config, client, score_store, lock_store, clock, violations)
+    })
+    .on_response(response_filter);
     launcher.launch(filter).await?;
     Ok(())
 }
@@ -727,6 +759,7 @@ async fn configure(
     client: HttpClient,
     storage_builder: DataStorageBuilder,
     clock: Clock,
+    violations: PolicyViolations,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -743,11 +776,11 @@ async fn configure(
     if config.distributed.unwrap_or(false) {
         let score_store = storage_builder.remote(SCORE_CACHE_NAMESPACE, score_store_ttl_ms(&config));
         let lock_store = storage_builder.remote(REFRESH_LOCK_NAMESPACE, REFRESH_LOCK_TTL_MS);
-        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock).await
+        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock, &violations).await
     } else {
         let score_store = storage_builder.local(SCORE_CACHE_NAMESPACE);
         let lock_store = storage_builder.local(REFRESH_LOCK_NAMESPACE);
-        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock).await
+        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock, &violations).await
     }
 }
 
@@ -1007,6 +1040,77 @@ mod test {
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["error"]["code"], -32008);
         assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn no_score_defaults_to_fail_closed_and_emits_violation() {
+        // #10: with blockOnUnknownScore UNSET, the code default (`unwrap_or(true)`) must fail
+        // CLOSED -- distinct from `no_score_and_block_on_unknown_true_rejects`, which sets the flag
+        // explicitly. This guards the posture even when the gcl default is not applied (pdk-unit
+        // does not pre-fill definition defaults, so the in-code default is what governs here).
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        // No CDGC score upstream at all -> fetch fails -> no score available.
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(11));
+
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["error"]["code"], -32008, "unset flag must fail closed");
+        assert!(backend.next().is_none(), "blocked request must never reach the MCP backend");
+        // The denial must surface to Anypoint Monitoring as a PolicyViolation.
+        let violation = response.violation().expect("fail-closed block must emit a PolicyViolation");
+        assert_eq!(violation.get_policy_name(), "test_policy_id");
+    }
+
+    #[test]
+    fn soft_launch_passes_ungated_when_block_on_unknown_false() {
+        // #10: the deliberate soft-launch posture. With no score available and
+        // blockOnUnknownScore=false, traffic passes UNGATED (status "unknown") and reaches the
+        // upstream MCP server rather than being blocked.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "blockOnUnknownScore": false })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(12));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("unknown"));
+        assert!(response.body().is_empty(), "a soft-launch pass-through must not carry an error body");
+        assert!(backend.next().is_some(), "soft-launch traffic must reach the MCP backend");
+        // A pass-through is not a denial: no PolicyViolation is reported.
+        assert!(response.violation().is_none(), "an ungated pass-through must not emit a violation");
+    }
+
+    #[test]
+    fn below_block_threshold_emits_policy_violation() {
+        // #10: a score below blockThreshold is a denial and must surface a PolicyViolation
+        // alongside the Flow::Break, so blocks are visible in platform monitoring.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(13));
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        let violation = response.violation().expect("below-threshold block must emit a PolicyViolation");
+        assert_eq!(violation.get_policy_name(), "test_policy_id");
     }
 
     /// Shared builder for the fail-open recognition tests below: a live-but-low (50.0) CDGC score

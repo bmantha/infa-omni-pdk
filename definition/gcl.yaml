@@ -86,16 +86,20 @@ spec:
       type: boolean
       default: true
       description: >-
-        If a stale-cache request's inline CDGC fetch fails (timeout, auth failure, 5xx),
-        keep serving the last known-good cached score when true. If false, treat a fetch
-        failure as if the score were unknown and apply blockOnUnknownScore behavior instead.
+        Posture for a *transient* CDGC error on an asset whose score is already known. If a
+        stale-cache refresh fails (timeout, auth failure, 5xx) but a last-known-good cached score
+        exists, keep serving it when true (fail-open on cache). If false, treat the failure as an
+        unknown score and apply blockOnUnknownScore instead. Orthogonal to blockOnUnknownScore:
+        this governs known-asset transient errors; that governs the no-score-at-all case.
     blockOnUnknownScore:
       type: boolean
-      default: false
+      default: true
       description: >-
-        Whether to block requests when no cached score is available yet (e.g. right
-        after a fresh policy/worker start, before the first periodic fetch completes,
-        or after a failOpenOnCdgcError=false failure). Default is fail-open (pass through).
+        Posture when NO score is available at all (cold worker start before the first fetch, or a
+        failOpenOnCdgcError=false failure with an empty cache). Default true = fail-CLOSED: the gate
+        blocks rather than silently passing ungated traffic during the exact windows (startup, CDGC
+        outage) an operator is least likely to notice. Set false only for a deliberate soft launch,
+        which passes such traffic through ungated (a one-time warn marks the bypass window).
     discloseScoreDetails:
       type: boolean
       default: false
