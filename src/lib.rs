@@ -41,23 +41,38 @@ const CAS_MAX_RETRIES: u32 = 3;
 const DEFAULT_TIMEOUT_MS: i64 = 60_000;
 const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
 const CDGC_JWT_NONCE: &str = "1234";
-const JSONRPC_BLOCK_ERROR_CODE: i64 = -32000;
+/// JSON-RPC error code returned when a request is blocked. Chosen from the JSON-RPC 2.0
+/// server-defined reserved range (`-32000..=-32099`) and deliberately NOT `-32000`, which collides
+/// with the common router/proxy "path or method not found" convention; `-32008` is this policy's
+/// dedicated "blocked by DQ Gate" code, used consistently on both block paths (below-threshold and
+/// unknown-score).
+const JSONRPC_BLOCK_ERROR_CODE: i64 = -32008;
 const HEADER_DQ_SCORE: &str = "x-dq-gate-score";
 const HEADER_DQ_STATUS: &str = "x-dq-gate-status";
 
-/// MCP handshake/discovery methods that must always pass through ungated. An MCP client (e.g.
-/// `mcp-remote`) issues `initialize` and `tools/list` just to establish the connection and
-/// enumerate capabilities, before the agent has chosen to invoke anything -- blocking those means
-/// the client never even connects, rather than surfacing a per-call block. Gating is reserved for
-/// methods that actually touch upstream data (`tools/call` and anything not explicitly exempted).
+/// MCP handshake, discovery, and administrative methods that must always pass through ungated. An
+/// MCP client (e.g. `mcp-remote`) issues `initialize` and `tools/list` just to establish the
+/// connection and enumerate capabilities, before the agent has chosen to invoke anything --
+/// blocking those means the client never even connects, rather than surfacing a per-call block.
+/// `logging/setLevel` and `completion/complete` are control/helper calls that touch no governed
+/// asset data, so gating them on a data-quality score would be semantically wrong.
+///
+/// DQ gating is deliberately reserved for the *content-bearing* methods that actually read the
+/// governed asset's data: `tools/call`, `resources/read`, and `prompts/get`. Any method that is not
+/// in this exempt list (and is not a notification) is gated.
+///
+/// Note: all `notifications/*` methods are handled earlier by the notification guard in
+/// `request_filter` (a notification may never receive a response), so they are intentionally absent
+/// from this list.
 const EXEMPT_METHODS: &[&str] = &[
     "initialize",
-    "notifications/initialized",
     "tools/list",
     "resources/list",
     "resources/templates/list",
     "prompts/list",
     "ping",
+    "logging/setLevel",
+    "completion/complete",
 ];
 
 /// The cached DQ score for `cdgcAssetId`, and when it was fetched -- compared against
@@ -152,18 +167,30 @@ fn aggregate_score(results: &[DqDimensionResult], mode: &str) -> Option<f64> {
     }
 }
 
-/// Extracts the JSON-RPC `id` field from an MCP request body, so a block response can echo it
-/// back. Per JSON-RPC 2.0, an unparsable/missing id degrades to `null`, not to failing the block.
-fn extract_jsonrpc_id(body: &[u8]) -> Option<Value> {
-    let json: Value = serde_json::from_slice(body).ok()?;
-    json.get("id").cloned()
+/// Whether a JSON-RPC method name denotes an MCP notification. Per MCP/JSON-RPC 2.0 a notification
+/// carries no `id` and MUST NEVER receive a response, so it can never be blocked. All MCP
+/// notifications use the `notifications/` prefix.
+fn is_notification_method(method: &str) -> bool {
+    method.starts_with("notifications/")
 }
 
-/// Extracts the JSON-RPC `method` field from an MCP request body, used to decide whether this
-/// request is a handshake/discovery call exempt from DQ gating (see [`EXEMPT_METHODS`]).
-fn extract_jsonrpc_method(body: &[u8]) -> Option<String> {
+/// Parses a request body as a single JSON-RPC 2.0 request and returns its `(method, id)`.
+///
+/// Returns `None` -- meaning "not a gate-able MCP call, pass through (fail-open)" -- for anything
+/// that is not a single well-formed JSON-RPC 2.0 object carrying a string `method`: unparsable
+/// JSON, a top-level array (a JSON-RPC *batch*, which is out of scope for gating here), a scalar, a
+/// response object, a missing or non-`"2.0"` `jsonrpc` tag, or a missing `method`. The `id` is
+/// returned verbatim (absent → `None`, which the caller treats as a notification); it is echoed
+/// back in a block response so the client can correlate it.
+fn parse_jsonrpc_call(body: &[u8]) -> Option<(String, Option<Value>)> {
     let json: Value = serde_json::from_slice(body).ok()?;
-    json.get("method")?.as_str().map(str::to_string)
+    let obj = json.as_object()?;
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return None;
+    }
+    let method = obj.get("method")?.as_str()?.to_string();
+    let id = obj.get("id").cloned();
+    Some((method, id))
 }
 
 /// Builds the JSON-RPC error response returned to the agent when a request is blocked. Status
@@ -469,19 +496,50 @@ async fn request_filter<S: DataStorage>(
     // filter until we decide, so Flow::Break always wins (see #2). The known response-leg hang
     // with this combined state does not apply here -- this is the request leg.
     let state = request_state.into_headers_body_state().await;
+
+    // Fail-open recognition (pdk-mcp contract): only gate genuine MCP tool-invocation traffic.
+    // Anything that is not a POST of a JSON-RPC 2.0 object -- a GET opening a Streamable-HTTP SSE
+    // session, a health probe, a non-JSON content type, unparsable JSON, or a batch array --
+    // passes straight through ungated, so the policy never breaks non-MCP traffic or connection
+    // establishment. This is the opposite of failing closed on anything it does not understand.
+    let request_method = state.handler().header(":method").unwrap_or_default();
+    if !request_method.eq_ignore_ascii_case("POST") {
+        logger::debug!("Non-POST request ('{request_method}'); passing through ungated");
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    }
+    let content_type = state.handler().header("content-type").unwrap_or_default();
+    if !content_type.to_ascii_lowercase().contains("application/json") {
+        logger::debug!("Non-JSON content-type ('{content_type}'); passing through ungated");
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    }
+
     let body = if state.contains_body() {
         state.handler().body()
     } else {
         Vec::new()
     };
-    let rpc_id = extract_jsonrpc_id(&body);
-    let method = extract_jsonrpc_method(&body);
 
-    if let Some(method) = &method {
-        if EXEMPT_METHODS.contains(&method.as_str()) {
-            logger::info!("Method '{method}' is exempt from DQ gating, passing through");
-            return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
-        }
+    let Some((method, rpc_id)) = parse_jsonrpc_call(&body) else {
+        logger::debug!(
+            "Request body is not a single JSON-RPC 2.0 call (unparsable, batch array, or missing method); passing through ungated"
+        );
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    };
+
+    // A notification (a `notifications/*` method, or any call without an `id`) may NEVER receive a
+    // response per JSON-RPC 2.0, so it can't be answered with a block error -- pass it through.
+    if is_notification_method(&method) || rpc_id.is_none() {
+        logger::debug!(
+            "Notification-style request '{method}' (no response permitted); passing through ungated"
+        );
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    }
+
+    // Handshake/discovery/administrative methods touch no asset data and are exempt; only the
+    // content-bearing set (tools/call, resources/read, prompts/get) is gated on the DQ score.
+    if EXEMPT_METHODS.contains(&method.as_str()) {
+        logger::info!("Method '{method}' is exempt from DQ gating, passing through");
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
     }
 
     let score = resolve_score(client, config, score_store, lock_store).await;
@@ -624,12 +682,14 @@ mod test {
     fn mcp_request(id: i64) -> UnitHttpRequest {
         UnitHttpRequest::post()
             .with_path("/mcp")
+            .with_header("content-type", "application/json")
             .with_body(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call" }).to_string())
     }
 
     fn mcp_request_with_method(id: i64, method: &str) -> UnitHttpRequest {
         UnitHttpRequest::post()
             .with_path("/mcp")
+            .with_header("content-type", "application/json")
             .with_body(json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string())
     }
 
@@ -696,7 +756,7 @@ mod test {
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 42);
-        assert_eq!(body["error"]["code"], -32000);
+        assert_eq!(body["error"]["code"], -32008);
         assert!(body["error"]["message"].as_str().unwrap().contains("blockThreshold"));
         // The MCP server backend must never be invoked for a blocked request.
         assert!(backend.next().is_none());
@@ -785,8 +845,154 @@ mod test {
         let response = tester.request(mcp_request(7));
 
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
-        assert_eq!(body["error"]["code"], -32000);
+        assert_eq!(body["error"]["code"], -32008);
         assert!(backend.next().is_none());
+    }
+
+    /// Shared builder for the fail-open recognition tests below: a live-but-low (50.0) CDGC score
+    /// is registered so that *if* a request were ever gated, it would be blocked -- letting each
+    /// test prove pass-through by asserting the backend was still reached, no error body was
+    /// returned, and (via `login_calls == 0`) that `resolve_score` never even ran.
+    fn recognition_tester<B: pdk_unit::Backend + 'static>(
+        login_calls: Rc<RefCell<u32>>,
+        backend: Rc<TraceBackend<B>>,
+    ) -> pdk_unit::UnitTest {
+        UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(backend)
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(login_calls))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure)
+    }
+
+    #[test]
+    fn non_post_request_passes_through_ungated() {
+        // A GET (e.g. opening a Streamable-HTTP SSE session) must never be gated, even though a
+        // low CDGC score is available -- if it reached resolve_score it would be blocked.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        let response = tester.request(UnitHttpRequest::get().with_path("/mcp"));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(response.body().is_empty(), "a passed-through GET must not receive an error body");
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0, "resolve_score must not run for a non-POST request");
+    }
+
+    #[test]
+    fn non_json_content_type_passes_through_ungated() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        let request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "text/plain")
+            .with_body(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }).to_string());
+        let response = tester.request(request);
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn non_jsonrpc_body_passes_through_ungated() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        // Valid JSON, but not a JSON-RPC 2.0 call (no jsonrpc/method) -> fail open.
+        let request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "hello": "world" }).to_string());
+        let response = tester.request(request);
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn batch_array_body_fails_open() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        // A JSON-RPC batch (top-level array) is out of scope for gating and must fail open.
+        let request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json")
+            .with_body(json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }]).to_string());
+        let response = tester.request(request);
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(response.body().is_empty(), "a batch must not receive a single error object");
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn notifications_pass_through_ungated_and_never_block() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        // A notification carries no id and must never receive a response, even below threshold.
+        for method in [
+            "notifications/cancelled",
+            "notifications/progress",
+            "notifications/roots/list_changed",
+        ] {
+            let request = UnitHttpRequest::post()
+                .with_path("/mcp")
+                .with_header("content-type", "application/json")
+                .with_body(json!({ "jsonrpc": "2.0", "method": method }).to_string());
+            let response = tester.request(request);
+            assert_eq!(response.status_code(), 200, "{method} must pass through");
+            assert_eq!(response.header("x-dq-gate-status"), Some("skipped"), "{method}");
+            assert!(response.body().is_empty(), "{} must not receive an error body", method);
+            assert!(backend.next().is_some(), "{} must reach the backend", method);
+        }
+        assert_eq!(*login_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn call_without_id_is_treated_as_notification_and_passes_through() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        // tools/call with no id -> cannot receive a response -> must pass through, not block.
+        let request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "jsonrpc": "2.0", "method": "tools/call" }).to_string());
+        let response = tester.request(request);
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(response.body().is_empty());
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn logging_setlevel_is_exempt_from_gating() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        // logging/setLevel touches no asset data; it must be exempt even below block threshold.
+        let response = tester.request(mcp_request_with_method(9, "logging/setLevel"));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0);
     }
 
     // --- DataStorage-native helper tests (pdk-runtime-model testable-helper pattern) ---
