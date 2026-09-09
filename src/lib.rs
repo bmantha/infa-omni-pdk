@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, StoreMode};
+use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
 use serde::{Deserialize, Serialize};
@@ -425,6 +426,7 @@ async fn resolve_score<S: DataStorage>(
     config: &Config,
     score_store: &S,
     lock_store: &S,
+    clock: &Clock,
 ) -> Option<f64> {
     let key = score_cache_key(config);
     let refresh_interval = config
@@ -435,7 +437,12 @@ async fn resolve_score<S: DataStorage>(
 
     let cached = read_cached_score(score_store, &key).await;
 
-    let now = unix_seconds(SystemTime::now());
+    // Read wall-clock time through the injected PDK `Clock`, never `SystemTime::now()`: proxy-wasm
+    // policies must source time from the host so it is testable and consistent with the runtime's
+    // clock (see the `pdk-timer` guidance). No `Timer` is built -- this policy has no periodic task,
+    // and `Clock::now()` is the sanctioned way to read the current time without setting a host tick
+    // period that would otherwise fire unconsumed wakeups.
+    let now = unix_seconds(clock.now());
     let is_stale = match &cached {
         Some(cached) => now - cached.timestamp > refresh_interval,
         None => true,
@@ -495,6 +502,7 @@ async fn request_filter<S: DataStorage>(
     client: &HttpClient,
     score_store: &S,
     lock_store: &S,
+    clock: &Clock,
 ) -> Flow<DqGateData> {
     // Atomically buffer request headers AND body before deciding. The split
     // into_headers_state() -> into_body_state() path releases headers to Envoy's router, which
@@ -550,7 +558,7 @@ async fn request_filter<S: DataStorage>(
         return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
     }
 
-    let score = resolve_score(client, config, score_store, lock_store).await;
+    let score = resolve_score(client, config, score_store, lock_store, clock).await;
 
     // Only surface the raw numeric score to the client (via the x-dq-gate-score header on an
     // allowed response) when explicitly opted in; the coarse status header is always emitted. See
@@ -619,8 +627,9 @@ async fn launch_policy<S: DataStorage>(
     client: &HttpClient,
     score_store: &S,
     lock_store: &S,
+    clock: &Clock,
 ) -> Result<()> {
-    let filter = on_request(|rs| request_filter(rs, config, client, score_store, lock_store))
+    let filter = on_request(|rs| request_filter(rs, config, client, score_store, lock_store, clock))
         .on_response(response_filter);
     launcher.launch(filter).await?;
     Ok(())
@@ -632,6 +641,7 @@ async fn configure(
     Configuration(bytes): Configuration,
     client: HttpClient,
     storage_builder: DataStorageBuilder,
+    clock: Clock,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -648,11 +658,11 @@ async fn configure(
     if config.distributed.unwrap_or(false) {
         let score_store = storage_builder.remote(SCORE_CACHE_NAMESPACE, score_store_ttl_ms(&config));
         let lock_store = storage_builder.remote(REFRESH_LOCK_NAMESPACE, REFRESH_LOCK_TTL_MS);
-        launch_policy(launcher, &config, &client, &score_store, &lock_store).await
+        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock).await
     } else {
         let score_store = storage_builder.local(SCORE_CACHE_NAMESPACE);
         let lock_store = storage_builder.local(REFRESH_LOCK_NAMESPACE);
-        launch_policy(launcher, &config, &client, &score_store, &lock_store).await
+        launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock).await
     }
 }
 
