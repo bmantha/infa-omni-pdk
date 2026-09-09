@@ -8,10 +8,10 @@ metadata:
     description: >-
       Policy gates agent/MCP tool calls on a CDGC-governed asset's current data
       quality score, warning or blocking requests when quality drops below
-      configurable thresholds. The score is cached in a MuleSoft Object Store with
-      a long TTL (CDGC DQ scans run roughly daily) and refreshed lazily, inline, by
-      whichever request happens to see a stale cache entry — so almost every
-      request is a fast Object Store read, not a live CDGC call.
+      configurable thresholds. The score is cached in native gateway data storage
+      with a long TTL (CDGC DQ scans run roughly daily) and refreshed lazily,
+      inline, by whichever request happens to see a stale cache entry — so almost
+      every request is a fast local cache read, not a live CDGC call.
     metadata/capabilities/injectionPoint: inbound
     metadata/interfaceScope: api,resource
 spec:
@@ -94,31 +94,18 @@ spec:
         Whether to block requests when no cached score is available yet (e.g. right
         after a fresh policy/worker start, before the first periodic fetch completes,
         or after a failOpenOnCdgcError=false failure). Default is fail-open (pass through).
-    objectStoreAuthUrl:
-      type: string
-      format: service
-      description: "Complete OAuth token endpoint URL, e.g. https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token."
-    objectStoreUrl:
-      type: string
-      format: service
-      description: "Object Store V2 host URL, e.g. https://object-store-us-west-2.anypoint.mulesoft.com."
-    objectStoreClientId:
-      type: string
-      description: OAuth2 client ID for authenticating with the Object Store service.
-    objectStoreClientSecret:
-      type: string
-      description: OAuth2 client secret for authenticating with the Object Store service.
-      "@context":
-        "@characteristics":
-          - security:sensitive
-    objectStoreName:
-      type: string
-      default: dq-gate-store
-      description: Name of the Object Store used to persist the cached DQ score.
+    distributed:
+      type: boolean
+      default: false
+      description: >-
+        Share the cached DQ score and refresh lock across gateway replicas via
+        gossip-replicated storage (requires shared storage configured on the
+        gateway). When false (default), each replica keeps its own in-memory
+        cache and refreshes independently.
     timeout:
       type: integer
       default: 60000
-      description: Timeout in milliseconds for CDGC (Login/JWT/score) and Object Store HTTP requests.
+      description: Timeout in milliseconds for CDGC Login/JWT/Detail HTTP requests.
   required:
     - cdgcLoginUrl
     - cdgcBaseApiUrl
@@ -127,8 +114,3 @@ spec:
     - cdgcAssetId
     - warnThreshold
     - blockThreshold
-    - objectStoreAuthUrl
-    - objectStoreUrl
-    - objectStoreClientId
-    - objectStoreClientSecret
-    - objectStoreName

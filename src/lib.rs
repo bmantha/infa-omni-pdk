@@ -4,20 +4,40 @@ mod generated;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
-use pdk::data_storage::{DataStorage, DataStorageBuilder, StoreMode};
+use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, StoreMode};
 use pdk::hl::*;
 use pdk::logger;
-use pdk::metadata::Metadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generated::config::Config;
 
-const OAUTH_TOKEN_CACHE_NAMESPACE: &str = "dq-gate-object-store-oauth-tokens";
-const OAUTH_TOKEN_CACHE_KEY: &str = "object-store-oauth-token";
+/// Namespaces for the two PDK-native [`DataStorage`] instances this policy uses. They are kept
+/// separate (per the distributed-cache guidance) because the score and the refresh lock have very
+/// different lifetimes and, on the remote backend, different namespace TTLs.
+const SCORE_CACHE_NAMESPACE: &str = "dq-gate-score";
+const REFRESH_LOCK_NAMESPACE: &str = "dq-gate-refresh-lock";
+
 const SCORE_CACHE_KEY_PREFIX: &str = "dq-score-";
 const REFRESH_LOCK_KEY_PREFIX: &str = "dq-refresh-lock-";
 const REFRESH_LOCK_TTL_SECONDS: i64 = 30;
+
+/// Remote (gossip) namespace TTLs, in milliseconds.
+///
+/// The lock namespace expires entries automatically shortly after a lock's useful life, so a
+/// crashed refresh holder cannot wedge the lock forever. The score namespace, by contrast, is
+/// deliberately long-lived: staleness for *refresh* decisions is tracked manually via
+/// [`CachedScore::timestamp`], and a stored score must outlive `refreshIntervalSeconds` by a wide
+/// margin so a last-known-good value is still present to serve when `failOpenOnCdgcError=true` and
+/// CDGC is unreachable. Never rely on TTL eviction to expire the score -- that would destroy the
+/// very value fail-open depends on.
+const REFRESH_LOCK_TTL_MS: u32 = (REFRESH_LOCK_TTL_SECONDS as u32) * 1000;
+const SCORE_STORE_MIN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/// Bounded retries for a CAS-guarded write; a conflict just means another writer won the race, so
+/// a small count is enough (see `pdk-distributed-cache-gossip`).
+const CAS_MAX_RETRIES: u32 = 3;
+
 const DEFAULT_TIMEOUT_MS: i64 = 60_000;
 const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
 const CDGC_JWT_NONCE: &str = "1234";
@@ -40,41 +60,6 @@ const EXEMPT_METHODS: &[&str] = &[
     "ping",
 ];
 
-/// Organization/environment scope used to build Object Store REST paths, sourced from the
-/// policy's injected [`Metadata`] (populated from the Flex Gateway registration) rather than a
-/// static config property.
-struct ObjectStoreScope {
-    org_id: String,
-    env_id: String,
-}
-
-/// Derives the Object Store scope from the policy's platform metadata. Returns `None` -- and logs
-/// once -- if the gateway isn't registered against an Anypoint Platform org/environment, which
-/// disables score caching entirely (every request then falls back to a live CDGC fetch, subject
-/// to `blockOnUnknownScore`/`failOpenOnCdgcError` if that fetch fails).
-fn object_store_scope(metadata: &Metadata) -> Option<ObjectStoreScope> {
-    let org_id = metadata.platform_metadata.organization_id.clone();
-    let env_id = metadata.platform_metadata.environment_id.clone();
-
-    if org_id.is_empty() || env_id.is_empty() {
-        logger::warn!("Missing org/env in metadata, DQ score caching disabled");
-        return None;
-    }
-
-    Some(ObjectStoreScope { org_id, env_id })
-}
-
-/// Envelope shape used by the Object Store V2 REST API for a stored key's value.
-#[derive(Serialize, Deserialize)]
-struct ObjectStoreEnvelope {
-    #[serde(rename = "stringValue")]
-    string_value: String,
-    #[serde(rename = "keyId")]
-    key_id: String,
-    #[serde(rename = "valueType")]
-    value_type: String,
-}
-
 /// The cached DQ score for `cdgcAssetId`, and when it was fetched -- compared against
 /// `refreshIntervalSeconds` on every request to decide whether a live CDGC fetch is needed.
 #[derive(Serialize, Deserialize, Clone)]
@@ -83,17 +68,11 @@ struct CachedScore {
     timestamp: i64,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedOauthToken {
-    access_token: String,
-    valid_until: SystemTime,
-}
-
-#[derive(Deserialize)]
-struct OauthTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    expires_in: Option<u64>,
+/// The stampede refresh lock's value: the unix second at which the current holder acquired it.
+/// Compared against [`REFRESH_LOCK_TTL_SECONDS`] to decide whether a held lock is still fresh.
+#[derive(Serialize, Deserialize, Clone)]
+struct RefreshLock {
+    acquired_at: i64,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +121,22 @@ fn unix_seconds(time: SystemTime) -> i64 {
 
 fn score_cache_key(config: &Config) -> String {
     format!("{SCORE_CACHE_KEY_PREFIX}{}", config.cdgc_asset_id)
+}
+
+fn refresh_lock_key(config: &Config) -> String {
+    format!("{REFRESH_LOCK_KEY_PREFIX}{}", config.cdgc_asset_id)
+}
+
+/// TTL (ms) for the remote score namespace. See [`SCORE_STORE_MIN_TTL_MS`]: deliberately long so a
+/// last-known-good score outlives `refreshIntervalSeconds` and remains available for fail-open
+/// serving. Floored at 30 days, never below 2x the refresh interval, capped at `u32::MAX` ms.
+fn score_store_ttl_ms(config: &Config) -> u32 {
+    let refresh_secs = config
+        .refresh_interval_seconds
+        .unwrap_or(DEFAULT_REFRESH_INTERVAL_SECONDS)
+        .max(0) as u64;
+    let derived_ms = refresh_secs.saturating_mul(2).saturating_mul(1000);
+    derived_ms.max(SCORE_STORE_MIN_TTL_MS).min(u32::MAX as u64) as u32
 }
 
 /// Combines the per-dimension `DQResult` scores CDGC returns for the asset into the single
@@ -202,200 +197,102 @@ fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) ->
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
-/// Fetches an Object Store V2 access token via OAuth2 client-credentials, caching it in-memory
-/// until shortly before it expires so we don't re-authenticate on every request.
-async fn fetch_object_store_token(
-    client: &HttpClient,
-    config: &Config,
-    token_cache: &impl DataStorage,
-) -> Result<String> {
-    if let Ok(Some((cached, _))) = token_cache.get::<CachedOauthToken>(OAUTH_TOKEN_CACHE_KEY).await {
-        if SystemTime::now() < cached.valid_until {
-            return Ok(cached.access_token);
+/// Reads the cached DQ score from PDK-native [`DataStorage`]. A storage error degrades to a cache
+/// miss (`None`) with a warning, so a transient storage hiccup falls back to a live CDGC fetch
+/// rather than failing the request.
+async fn read_cached_score<S: DataStorage>(store: &S, key: &str) -> Option<CachedScore> {
+    match store.get::<CachedScore>(key).await {
+        Ok(Some((cached, _version))) => Some(cached),
+        Ok(None) => None,
+        Err(err) => {
+            logger::warn!("Failed to read cached DQ score from data storage: {err}");
+            None
         }
     }
+}
 
-    let request_body = serde_json::to_vec(&serde_json::json!({
-        "client_id": config.object_store_client_id,
-        "client_secret": config.object_store_client_secret,
-        "grant_type": "client_credentials",
-    }))?;
-
-    let response = client
-        .request(&config.object_store_auth_url)
-        .headers(vec![("Content-Type", "application/json")])
-        .body(&request_body)
-        .timeout(timeout(config))
-        .post()
-        .await
-        .map_err(|err| anyhow!("Object Store OAuth token request failed: {err}"))?;
-
-    if response.status_code() >= 300 {
-        return Err(anyhow!(
-            "Object Store OAuth returned status {}: {}",
-            response.status_code(),
-            String::from_utf8_lossy(response.body())
-        ));
+/// Persists a refreshed score using a gossip-safe write: `StoreMode::Absent` on a cache miss, or a
+/// `StoreMode::Cas` overwrite on an existing entry. Never DELETE-then-insert -- on the remote
+/// (gossip) backend a DELETE tombstone can propagate *after* the new write and destroy it. A CAS
+/// conflict just means another refresher wrote first, so we re-read and retry a bounded number of
+/// times; any hard error is logged and swallowed (the in-flight request already has its score).
+async fn write_cached_score<S: DataStorage>(store: &S, key: &str, cached: &CachedScore) {
+    for _ in 0..CAS_MAX_RETRIES {
+        match store.get::<CachedScore>(key).await {
+            Ok(Some((_, version))) => match store.store(key, &StoreMode::Cas(version), cached).await {
+                Ok(()) => return,
+                // Retriable: a concurrent writer bumped the version. Re-read and try again.
+                Err(DataStorageError::CasMismatch) => continue,
+                Err(err) => {
+                    logger::warn!("Failed to persist refreshed DQ score: {err}");
+                    return;
+                }
+            },
+            Ok(None) => match store.store(key, &StoreMode::Absent, cached).await {
+                Ok(()) => return,
+                // Retriable: another writer created the entry between our read and write.
+                Err(DataStorageError::CasMismatch) => continue,
+                Err(err) => {
+                    logger::warn!("Failed to persist refreshed DQ score: {err}");
+                    return;
+                }
+            },
+            Err(err) => {
+                logger::warn!("Failed to read DQ score before persisting refresh: {err}");
+                return;
+            }
+        }
     }
-
-    let parsed: OauthTokenResponse = serde_json::from_slice(response.body())
-        .map_err(|err| anyhow!("Failed to parse OAuth token response: {err}"))?;
-
-    let valid_until =
-        SystemTime::now() + Duration::from_secs(parsed.expires_in.unwrap_or(3600).saturating_sub(30));
-    let cached = CachedOauthToken {
-        access_token: parsed.access_token.clone(),
-        valid_until,
-    };
-    let _ = token_cache.store(OAUTH_TOKEN_CACHE_KEY, &StoreMode::Always, &cached).await;
-
-    Ok(parsed.access_token)
+    logger::warn!("Exhausted CAS retries persisting refreshed DQ score for key '{key}'");
 }
 
-/// Builds the Object Store V2 REST path for a cache entry key.
-fn object_store_path(scope: &ObjectStoreScope, config: &Config, key: &str) -> String {
-    format!(
-        "/api/v1/organizations/{}/environments/{}/stores/{}/partitions/default/keys/{}",
-        scope.org_id, scope.env_id, config.object_store_name, key
-    )
-}
-
-async fn object_store_get(
-    client: &HttpClient,
-    config: &Config,
-    scope: &ObjectStoreScope,
-    token: &str,
+/// Best-effort single-initiator lock so that when the cached score goes stale under concurrent
+/// traffic, only one request pays for the (expensive) CDGC Login+JWT+Detail sequence instead of
+/// every in-flight request hammering CDGC at once -- which is exactly what produces a CDGC `429`
+/// under load. Unlike the previous Object Store V2 implementation (which had no CAS primitive and
+/// so was a racy GET-then-PUT), this uses `StoreMode::Absent` for an atomic put-if-absent.
+///
+/// Returns:
+/// - `Ok(true)`  -- this request acquired the lock and must perform the refresh.
+/// - `Ok(false)` -- another request holds a still-fresh lock; serve the existing cached value.
+/// - `Err(_)`    -- a hard storage error; the caller decides (we favour freshness and refresh).
+///
+/// On `CasMismatch` (the key already exists) the held lock is classified by age: if older than
+/// [`REFRESH_LOCK_TTL_SECONDS`] the holder is presumed dead and the lock is taken over with a
+/// CAS-overwrite -- never a DELETE, to avoid a gossip tombstone race.
+async fn try_acquire_refresh_lock<S: DataStorage>(
+    lock_store: &S,
     key: &str,
-) -> Result<Option<Vec<u8>>> {
-    let path = object_store_path(scope, config, key);
-    let authorization = format!("Bearer {token}");
-
-    let response = client
-        .request(&config.object_store_url)
-        .path(&path)
-        .headers(vec![("Authorization", authorization.as_str())])
-        .timeout(timeout(config))
-        .get()
-        .await
-        .map_err(|err| anyhow!("Object Store get failed: {err}"))?;
-
-    match response.status_code() {
-        200 => Ok(Some(response.body().to_vec())),
-        404 => Ok(None),
-        status => Err(anyhow!(
-            "Object Store get returned {status}: {}",
-            String::from_utf8_lossy(response.body())
-        )),
-    }
-}
-
-async fn object_store_put(
-    client: &HttpClient,
-    config: &Config,
-    scope: &ObjectStoreScope,
-    token: &str,
-    key: &str,
-    value: &[u8],
-) -> Result<()> {
-    let path = object_store_path(scope, config, key);
-    let authorization = format!("Bearer {token}");
-
-    let envelope = ObjectStoreEnvelope {
-        string_value: String::from_utf8_lossy(value).into_owned(),
-        key_id: key.to_string(),
-        value_type: "STRING".to_string(),
-    };
-    let body = serde_json::to_vec(&envelope)?;
-
-    let response = client
-        .request(&config.object_store_url)
-        .path(&path)
-        .headers(vec![
-            ("Authorization", authorization.as_str()),
-            ("Content-Type", "application/json"),
-        ])
-        .body(&body)
-        .timeout(timeout(config))
-        .put()
-        .await
-        .map_err(|err| anyhow!("Object Store put failed: {err}"))?;
-
-    if response.status_code() >= 300 {
-        return Err(anyhow!(
-            "Object Store put returned {}: {}",
-            response.status_code(),
-            String::from_utf8_lossy(response.body())
-        ));
-    }
-
-    Ok(())
-}
-
-async fn get_cached_score(
-    client: &HttpClient,
-    config: &Config,
-    scope: &ObjectStoreScope,
-    token_cache: &impl DataStorage,
-    key: &str,
-) -> Result<Option<CachedScore>> {
-    let token = fetch_object_store_token(client, config, token_cache).await?;
-    let Some(bytes) = object_store_get(client, config, scope, &token, key).await? else {
-        return Ok(None);
-    };
-
-    let envelope: ObjectStoreEnvelope = serde_json::from_slice(&bytes)?;
-    let cached: CachedScore = serde_json::from_str(&envelope.string_value)?;
-    Ok(Some(cached))
-}
-
-async fn put_cached_score(
-    client: &HttpClient,
-    config: &Config,
-    scope: &ObjectStoreScope,
-    token_cache: &impl DataStorage,
-    key: &str,
-    cached: &CachedScore,
-) -> Result<()> {
-    let token = fetch_object_store_token(client, config, token_cache).await?;
-    let bytes = serde_json::to_vec(cached)?;
-    object_store_put(client, config, scope, &token, key, &bytes).await
-}
-
-fn refresh_lock_key(config: &Config) -> String {
-    format!("{REFRESH_LOCK_KEY_PREFIX}{}", config.cdgc_asset_id)
-}
-
-/// Best-effort mutex over the Object Store so that when the cached score goes stale under heavy
-/// concurrent traffic, only one request pays for the (expensive) CDGC Login+JWT+Detail sequence
-/// instead of every in-flight request independently hammering CDGC at once -- which is exactly
-/// what produces a CDGC `429` under load. Object Store V2 has no conditional-put/CAS primitive,
-/// so this is GET-then-PUT, not a true atomic lock: a handful of concurrent *first* acquirers can
-/// still race through right at the moment the lock expires. That's an acceptable tradeoff here --
-/// the goal is collapsing a stampede of hundreds of concurrent refreshes down to roughly one per
-/// `REFRESH_LOCK_TTL_SECONDS` window, not perfect mutual exclusion.
-async fn try_acquire_refresh_lock(
-    client: &HttpClient,
-    config: &Config,
-    scope: &ObjectStoreScope,
-    token_cache: &impl DataStorage,
     now: i64,
-) -> Result<bool> {
-    let key = refresh_lock_key(config);
-    let token = fetch_object_store_token(client, config, token_cache).await?;
-
-    if let Some(bytes) = object_store_get(client, config, scope, &token, &key).await? {
-        let held = serde_json::from_slice::<ObjectStoreEnvelope>(&bytes)
-            .ok()
-            .and_then(|envelope| envelope.string_value.parse::<i64>().ok())
-            .map(|acquired_at| now - acquired_at < REFRESH_LOCK_TTL_SECONDS)
-            .unwrap_or(false);
-        if held {
-            return Ok(false);
-        }
+) -> Result<bool, DataStorageError> {
+    let entry = RefreshLock { acquired_at: now };
+    match lock_store.store(key, &StoreMode::Absent, &entry).await {
+        Ok(()) => Ok(true),
+        Err(DataStorageError::CasMismatch) => match lock_store.get::<RefreshLock>(key).await? {
+            Some((existing, version)) => {
+                if now - existing.acquired_at < REFRESH_LOCK_TTL_SECONDS {
+                    Ok(false)
+                } else {
+                    // Stale lock: take it over via CAS-overwrite (never DELETE).
+                    match lock_store.store(key, &StoreMode::Cas(version), &entry).await {
+                        Ok(()) => Ok(true),
+                        Err(DataStorageError::CasMismatch) => Ok(false),
+                        Err(err) => Err(err),
+                    }
+                }
+            }
+            None => {
+                // The lock vanished between our failed put-if-absent and this read; retry the
+                // atomic claim once.
+                match lock_store.store(key, &StoreMode::Absent, &entry).await {
+                    Ok(()) => Ok(true),
+                    Err(DataStorageError::CasMismatch) => Ok(false),
+                    Err(err) => Err(err),
+                }
+            }
+        },
+        Err(err) => Err(err),
     }
-
-    object_store_put(client, config, scope, &token, &key, now.to_string().as_bytes()).await?;
-    Ok(true)
 }
 
 /// Runs the live CDGC sequence (Login -> JWT -> Detail API `dataQuality` segment) and aggregates
@@ -484,15 +381,15 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
         .ok_or_else(|| anyhow!("CDGC returned no dataQuality dimensions for asset '{}'", config.cdgc_asset_id))
 }
 
-/// The core lazy/TTL cache-aside logic: read the cached score, and if it's missing or older than
-/// `refreshIntervalSeconds`, refresh it from CDGC right here, inline, before returning a score to
-/// gate on. Returns `None` only when no score is available at all (no cache, and the refresh --
-/// if attempted -- also failed with `failOpenOnCdgcError=false`).
-async fn resolve_score(
+/// The core lazy/TTL cache-aside logic: read the cached score from PDK-native [`DataStorage`], and
+/// if it's missing or older than `refreshIntervalSeconds`, refresh it from CDGC right here, inline,
+/// before returning a score to gate on. Returns `None` only when no score is available at all (no
+/// cache, and the refresh -- if attempted -- also failed with `failOpenOnCdgcError=false`).
+async fn resolve_score<S: DataStorage>(
     client: &HttpClient,
     config: &Config,
-    object_store_scope: Option<&ObjectStoreScope>,
-    token_cache: &impl DataStorage,
+    score_store: &S,
+    lock_store: &S,
 ) -> Option<f64> {
     let key = score_cache_key(config);
     let refresh_interval = config
@@ -501,16 +398,7 @@ async fn resolve_score(
         .max(0);
     let fail_open = config.fail_open_on_cdgc_error.unwrap_or(true);
 
-    let cached = match object_store_scope {
-        Some(scope) => match get_cached_score(client, config, scope, token_cache, &key).await {
-            Ok(cached) => cached,
-            Err(err) => {
-                logger::warn!("Failed to read cached DQ score from Object Store: {err}");
-                None
-            }
-        },
-        None => None,
-    };
+    let cached = read_cached_score(score_store, &key).await;
 
     let now = unix_seconds(SystemTime::now());
     let is_stale = match &cached {
@@ -528,21 +416,21 @@ async fn resolve_score(
         return cached.map(|cached| cached.score);
     }
 
-    if let Some(scope) = object_store_scope {
-        let lock_acquired = match try_acquire_refresh_lock(client, config, scope, token_cache, now).await {
-            Ok(acquired) => acquired,
-            Err(err) => {
-                logger::warn!("Failed to acquire DQ score refresh lock: {err}");
-                true
-            }
-        };
-        if !lock_acquired {
-            logger::info!(
-                "DQ score refresh for asset '{}' already in progress elsewhere; serving existing cached value",
-                config.cdgc_asset_id
-            );
-            return cached.map(|cached| cached.score);
+    // Stale or missing: coordinate so only one request refreshes from CDGC.
+    let lock_key = refresh_lock_key(config);
+    let lock_acquired = match try_acquire_refresh_lock(lock_store, &lock_key, now).await {
+        Ok(acquired) => acquired,
+        Err(err) => {
+            logger::warn!("Failed to acquire DQ score refresh lock: {err}; proceeding with refresh");
+            true
         }
+    };
+    if !lock_acquired {
+        logger::info!(
+            "DQ score refresh for asset '{}' already in progress elsewhere; serving existing cached value",
+            config.cdgc_asset_id
+        );
+        return cached.map(|cached| cached.score);
     }
 
     match fetch_cdgc_score(client, config).await {
@@ -551,12 +439,8 @@ async fn resolve_score(
                 "Fetched fresh DQ score from CDGC for asset '{}': {score:.2}",
                 config.cdgc_asset_id
             );
-            if let Some(scope) = object_store_scope {
-                let fresh = CachedScore { score, timestamp: now };
-                if let Err(err) = put_cached_score(client, config, scope, token_cache, &key, &fresh).await {
-                    logger::warn!("Failed to persist refreshed DQ score to Object Store: {err}");
-                }
-            }
+            let fresh = CachedScore { score, timestamp: now };
+            write_cached_score(score_store, &key, &fresh).await;
             Some(score)
         }
         Err(err) => {
@@ -570,12 +454,12 @@ async fn resolve_score(
     }
 }
 
-async fn request_filter(
+async fn request_filter<S: DataStorage>(
     request_state: RequestState,
     config: &Config,
     client: &HttpClient,
-    token_cache: &impl DataStorage,
-    object_store_scope: Option<&ObjectStoreScope>,
+    score_store: &S,
+    lock_store: &S,
 ) -> Flow<DqGateData> {
     let headers_state = request_state.into_headers_state().await;
     let body_state = headers_state.into_body_state().await;
@@ -590,7 +474,7 @@ async fn request_filter(
         }
     }
 
-    let score = resolve_score(client, config, object_store_scope, token_cache).await;
+    let score = resolve_score(client, config, score_store, lock_store).await;
 
     match score {
         None => {
@@ -641,13 +525,28 @@ async fn response_filter(response_state: ResponseState, request_data: RequestDat
     headers_state.into_body_state().await;
 }
 
+/// Wires the request/response filters against a concrete [`DataStorage`] backend. Kept generic over
+/// `S` so all cache/lock logic is backend-agnostic; the only place that chooses local vs remote is
+/// [`configure`].
+async fn launch_policy<S: DataStorage>(
+    launcher: Launcher,
+    config: &Config,
+    client: &HttpClient,
+    score_store: &S,
+    lock_store: &S,
+) -> Result<()> {
+    let filter = on_request(|rs| request_filter(rs, config, client, score_store, lock_store))
+        .on_response(response_filter);
+    launcher.launch(filter).await?;
+    Ok(())
+}
+
 #[entrypoint]
 async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     client: HttpClient,
     storage_builder: DataStorageBuilder,
-    metadata: Metadata,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -657,23 +556,34 @@ async fn configure(
         )
     })?;
 
-    let token_cache = storage_builder.local(OAUTH_TOKEN_CACHE_NAMESPACE);
-    let object_store_scope = object_store_scope(&metadata);
-
-    let filter = on_request(|rs| request_filter(rs, &config, &client, &token_cache, object_store_scope.as_ref()))
-        .on_response(response_filter);
-
-    launcher.launch(filter).await?;
-    Ok(())
+    // `distributed=true` shares the score cache and refresh lock across gateway replicas via the
+    // gossip-replicated remote backend (requires shared storage configured on the gateway);
+    // `false` (default) keeps them per-replica in memory. Downstream logic is identical either
+    // way -- see `launch_policy`.
+    if config.distributed.unwrap_or(false) {
+        let score_store = storage_builder.remote(SCORE_CACHE_NAMESPACE, score_store_ttl_ms(&config));
+        let lock_store = storage_builder.remote(REFRESH_LOCK_NAMESPACE, REFRESH_LOCK_TTL_MS);
+        launch_policy(launcher, &config, &client, &score_store, &lock_store).await
+    } else {
+        let score_store = storage_builder.local(SCORE_CACHE_NAMESPACE);
+        let lock_store = storage_builder.local(REFRESH_LOCK_NAMESPACE);
+        launch_policy(launcher, &config, &client, &score_store, &lock_store).await
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::rc::Rc;
+    use std::sync::Mutex;
 
+    use pdk::data_storage::{DataStorage, DataStorageError, StoreMode};
     use pdk_unit::{TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
+    use serde::{de::DeserializeOwned, Serialize};
     use serde_json::json;
+
+    use super::{CachedScore, REFRESH_LOCK_TTL_SECONDS};
 
     fn config() -> String {
         json!({
@@ -683,13 +593,8 @@ mod test {
             "cdgcOrgPassword": "test-pass",
             "cdgcAssetId": "asset-1",
             "warnThreshold": 90,
-            "blockThreshold": 70,
+            "blockThreshold": 80,
             "refreshIntervalSeconds": 86400,
-            "objectStoreAuthUrl": "http://objectstoreauth",
-            "objectStoreUrl": "http://objectstore",
-            "objectStoreClientId": "test-client-id",
-            "objectStoreClientSecret": "test-client-secret",
-            "objectStoreName": "test-store",
         })
         .to_string()
     }
@@ -712,22 +617,6 @@ mod test {
         UnitHttpRequest::post()
             .with_path("/mcp")
             .with_body(json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string())
-    }
-
-    /// Builds the raw Object Store envelope bytes for a key, matching what `object_store_put`
-    /// would have written, so tests can pre-seed the store's state directly.
-    fn envelope_bytes(key: &str, string_value: String) -> Vec<u8> {
-        serde_json::to_vec(&super::ObjectStoreEnvelope {
-            string_value,
-            key_id: key.to_string(),
-            value_type: "STRING".to_string(),
-        })
-        .unwrap()
-    }
-
-    fn oauth_backend(_req: UnitHttpRequest) -> UnitHttpResponse {
-        UnitHttpResponse::new(200)
-            .with_body(json!({ "access_token": "test-token", "expires_in": 3600 }).to_string())
     }
 
     /// Stateful CDGC login mock: always succeeds, tracking call count so tests can assert
@@ -755,33 +644,8 @@ mod test {
         }
     }
 
-    /// Stateful Object Store mock, mirroring the real Object Store V2 REST contract this policy
-    /// assumes: `PUT .../keys/{id}` stores the envelope body under `id`, `GET` returns it back
-    /// (or 404 if never stored).
-    fn object_store_backend(
-        store: Rc<RefCell<std::collections::HashMap<String, Vec<u8>>>>,
-    ) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
-        move |req: UnitHttpRequest| {
-            let path = req.header(":path").unwrap_or_default();
-            let key = path.split('?').next().unwrap_or_default().rsplit('/').next().unwrap_or_default().to_string();
-
-            match req.header(":method") {
-                Some("GET") => match store.borrow().get(&key) {
-                    Some(value) => UnitHttpResponse::new(200).with_body(value.clone()),
-                    None => UnitHttpResponse::new(404),
-                },
-                Some("PUT") => {
-                    store.borrow_mut().insert(key, req.body().to_vec());
-                    UnitHttpResponse::new(200)
-                }
-                _ => UnitHttpResponse::new(404),
-            }
-        }
-    }
-
     #[test]
     fn healthy_score_passes_through_and_tags_the_response() {
-        let store = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
@@ -790,8 +654,6 @@ mod test {
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
-            .with_http_upstream_from_authority("objectstoreauth", oauth_backend)
-            .with_http_upstream_from_authority("objectstore", object_store_backend(Rc::clone(&store)))
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(1));
@@ -800,12 +662,10 @@ mod test {
         assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
         assert_eq!(response.header("x-dq-gate-score"), Some("95.00"));
         assert!(backend.next().is_some());
-        assert!(!store.borrow().is_empty());
     }
 
     #[test]
     fn score_below_block_threshold_rejects_with_jsonrpc_error_and_never_calls_backend() {
-        let store = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
@@ -814,8 +674,6 @@ mod test {
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
-            .with_http_upstream_from_authority("objectstoreauth", oauth_backend)
-            .with_http_upstream_from_authority("objectstore", object_store_backend(Rc::clone(&store)))
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(42));
@@ -836,8 +694,7 @@ mod test {
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
         // No CDGC score upstream registered at all: if the exemption ever fell through to
-        // resolve_score, fetch_cdgc_score would fail with no score available, and
-        // blockOnUnknownScore defaults false so it would (incorrectly) still pass -- so this test
+        // resolve_score, fetch_cdgc_score would fail with no score available -- so this test
         // asserts on login_calls staying at zero, proving resolve_score was never even attempted.
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
@@ -857,7 +714,6 @@ mod test {
 
     #[test]
     fn score_below_warn_threshold_passes_through_with_a_warning() {
-        let store = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
@@ -865,9 +721,7 @@ mod test {
             .with_config(config())
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
-            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(80.0))
-            .with_http_upstream_from_authority("objectstoreauth", oauth_backend)
-            .with_http_upstream_from_authority("objectstore", object_store_backend(Rc::clone(&store)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(85.0))
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(2));
@@ -879,7 +733,6 @@ mod test {
 
     #[test]
     fn cached_score_within_ttl_skips_cdgc_entirely() {
-        let store = Rc::new(RefCell::new(std::collections::HashMap::new()));
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
@@ -888,16 +741,14 @@ mod test {
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
-            .with_http_upstream_from_authority("objectstoreauth", oauth_backend)
-            .with_http_upstream_from_authority("objectstore", object_store_backend(Rc::clone(&store)))
             .with_entrypoint(super::configure);
 
         let first = tester.request(mcp_request(1));
         assert_eq!(first.status_code(), 200);
         assert_eq!(*login_calls.borrow(), 1);
 
-        // Second request, well within the 24h refreshIntervalSeconds: must reuse the cached
-        // score from Object Store rather than re-authenticating to CDGC.
+        // Second request, well within the 24h refreshIntervalSeconds: must reuse the score cached
+        // in native DataStorage rather than re-authenticating to CDGC.
         let second = tester.request(mcp_request(2));
         assert_eq!(second.status_code(), 200);
         assert_eq!(second.header("x-dq-gate-status"), Some("ok"));
@@ -909,10 +760,8 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
-        // No Object Store upstream registered at all -> object_store_scope resolution still
-        // works (metadata-derived), but every Object Store call fails, and CDGC login itself
-        // also has no registered upstream, so fetch_cdgc_score fails too: no score is ever
-        // available. blockOnUnknownScore=true must reject rather than pass through.
+        // No CDGC score upstream registered, and CDGC login has no upstream either, so
+        // fetch_cdgc_score fails: no score is ever available. blockOnUnknownScore=true must reject.
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with(json!({ "blockOnUnknownScore": true })))
             .with_backend(Rc::clone(&backend))
@@ -926,40 +775,159 @@ mod test {
         assert!(backend.next().is_none());
     }
 
+    // --- DataStorage-native helper tests (pdk-runtime-model testable-helper pattern) ---
+
+    /// Minimal in-memory [`DataStorage`] test double with version tracking, so `StoreMode::Absent`
+    /// and `StoreMode::Cas` behave like the real backends (see `pdk-distributed-cache-gossip`).
+    struct MockDataStorage {
+        data: Mutex<HashMap<String, (Vec<u8>, u64)>>,
+    }
+
+    impl MockDataStorage {
+        fn new() -> Self {
+            Self { data: Mutex::new(HashMap::new()) }
+        }
+    }
+
+    impl DataStorage for MockDataStorage {
+        async fn get_keys(&self) -> Result<Vec<String>, DataStorageError> {
+            Ok(self.data.lock().unwrap().keys().cloned().collect())
+        }
+
+        async fn store<T: Serialize>(
+            &self,
+            key: &str,
+            mode: &StoreMode,
+            item: &T,
+        ) -> Result<(), DataStorageError> {
+            let bytes = serde_json::to_vec(item)
+                .map_err(|e| DataStorageError::Unexpected(e.to_string()))?;
+            let mut map = self.data.lock().unwrap();
+            match mode {
+                StoreMode::Always => {
+                    let version = map.get(key).map(|(_, v)| v + 1).unwrap_or(1);
+                    map.insert(key.to_string(), (bytes, version));
+                    Ok(())
+                }
+                StoreMode::Absent => {
+                    if map.contains_key(key) {
+                        return Err(DataStorageError::CasMismatch);
+                    }
+                    map.insert(key.to_string(), (bytes, 1));
+                    Ok(())
+                }
+                StoreMode::Cas(version) => {
+                    let expected: u64 = version.parse().map_err(|_| DataStorageError::CasMismatch)?;
+                    let current = map.get(key).map(|(_, v)| *v);
+                    match current {
+                        Some(current) if current == expected => {
+                            map.insert(key.to_string(), (bytes, current + 1));
+                            Ok(())
+                        }
+                        _ => Err(DataStorageError::CasMismatch),
+                    }
+                }
+            }
+        }
+
+        async fn get<T: DeserializeOwned>(
+            &self,
+            key: &str,
+        ) -> Result<Option<(T, String)>, DataStorageError> {
+            let map = self.data.lock().unwrap();
+            match map.get(key) {
+                Some((bytes, version)) => {
+                    let item = serde_json::from_slice(bytes)
+                        .map_err(|e| DataStorageError::Unexpected(e.to_string()))?;
+                    Ok(Some((item, version.to_string())))
+                }
+                None => Ok(None),
+            }
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), DataStorageError> {
+            self.data.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn delete_all(&self) -> Result<(), DataStorageError> {
+            self.data.lock().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    /// Minimal, dependency-free executor for the always-ready futures the mock produces. It busy-
+    /// loops on `Pending`, which is fine because `MockDataStorage`'s futures never actually pend.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::pin::pin;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut future = pin!(future);
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => continue,
+            }
+        }
+    }
+
     #[test]
-    fn refresh_lock_held_elsewhere_skips_cdgc_and_serves_stale_cached_score() {
-        let store = Rc::new(RefCell::new(std::collections::HashMap::new()));
-        let login_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+    fn refresh_lock_is_acquired_once_then_denied_while_fresh() {
+        let store = MockDataStorage::new();
+        let key = "dq-refresh-lock-asset-1";
 
-        // Simulate a stampede scenario: the cached score is long stale, but another concurrent
-        // request already acquired the refresh lock (acquired_at far in the future relative to
-        // "now", so it reads as comfortably within REFRESH_LOCK_TTL_SECONDS regardless of wall
-        // clock). This request must not itself call CDGC -- it should just serve the stale value.
-        let stale = super::CachedScore { score: 95.0, timestamp: 0 };
-        store.borrow_mut().insert(
-            "dq-score-asset-1".to_string(),
-            envelope_bytes("dq-score-asset-1", serde_json::to_string(&stale).unwrap()),
-        );
-        store.borrow_mut().insert(
-            "dq-refresh-lock-asset-1".to_string(),
-            envelope_bytes("dq-refresh-lock-asset-1", "9999999999".to_string()),
-        );
+        // First acquirer wins.
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, key, 1_000)).unwrap(), true);
+        // A second request while the lock is still fresh is denied.
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, key, 1_005)).unwrap(), false);
+    }
 
-        let mut tester = UnitTestBuilder::default()
-            .with_config(config())
-            .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
-            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(10.0))
-            .with_http_upstream_from_authority("objectstoreauth", oauth_backend)
-            .with_http_upstream_from_authority("objectstore", object_store_backend(Rc::clone(&store)))
-            .with_entrypoint(super::configure);
+    #[test]
+    fn refresh_lock_stale_holder_is_taken_over_via_cas() {
+        let store = MockDataStorage::new();
+        let key = "dq-refresh-lock-asset-1";
 
-        let response = tester.request(mcp_request(3));
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, key, 1_000)).unwrap(), true);
 
-        assert_eq!(*login_calls.borrow(), 0, "lock held elsewhere must prevent a CDGC refresh");
-        assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
-        assert_eq!(response.header("x-dq-gate-score"), Some("95.00"));
-        assert!(backend.next().is_some());
+        // Well past the TTL: the previous holder is presumed dead, so the lock is taken over.
+        let later = 1_000 + REFRESH_LOCK_TTL_SECONDS + 1;
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, key, later)).unwrap(), true);
+    }
+
+    #[test]
+    fn cached_score_round_trips_and_overwrites_via_cas() {
+        let store = MockDataStorage::new();
+        let key = "dq-score-asset-1";
+
+        // Miss -> None.
+        assert!(block_on(super::read_cached_score(&store, key)).is_none());
+
+        // First write uses Absent; read back the value.
+        block_on(super::write_cached_score(&store, key, &CachedScore { score: 95.0, timestamp: 10 }));
+        let first = block_on(super::read_cached_score(&store, key)).expect("score present");
+        assert_eq!(first.score, 95.0);
+        assert_eq!(first.timestamp, 10);
+
+        // Second write overwrites via CAS (no DELETE), and the new value is visible.
+        block_on(super::write_cached_score(&store, key, &CachedScore { score: 72.5, timestamp: 20 }));
+        let second = block_on(super::read_cached_score(&store, key)).expect("score present");
+        assert_eq!(second.score, 72.5);
+        assert_eq!(second.timestamp, 20);
+    }
+
+    #[test]
+    fn refresh_lock_uses_separate_keys_per_asset() {
+        let store = MockDataStorage::new();
+        // Two different assets must not share a lock.
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, "dq-refresh-lock-a", 1)).unwrap(), true);
+        assert_eq!(block_on(super::try_acquire_refresh_lock(&store, "dq-refresh-lock-b", 1)).unwrap(), true);
     }
 }
