@@ -71,11 +71,13 @@ The policy is wired to two MCP connectors in Claude Desktop that share the same 
 | `parks-guests-mcp` | 90 | 80 | ✅ allowed |
 | `parks-guests-b-mcp` | 70.26 | 80 | ❌ blocked by DQ gate |
 
-To run the demo, simply ask Claude to call both connectors (e.g. "look up guests checking out today"). The gate rejects the low-score connector inline and returns an error message citing the score and threshold — no Docker or local Flex Gateway needed.
+To run the demo, simply ask Claude to call both connectors (e.g. "look up guests checking out today"). The gate rejects the low-score connector inline and returns a generic block error — by default it does **not** disclose the score, threshold, or asset id to the client — no Docker or local Flex Gateway needed.
 
 ### How to surface DQ Gate errors to users
 
-When a connector call fails with a DQ Gate block, **do not expose raw scores or thresholds** in the response. Instead, explain the block in plain language, for example:
+By default the policy does **not** disclose the raw DQ score, `blockThreshold`, or asset id to the MCP client: the block message is generic and only the coarse `x-dq-gate-status` header (`ok`/`warn`/`blocked`/`skipped`/`unknown`) is emitted. The exact score, threshold, and asset id are recorded in the gateway logs only. An operator can opt in to disclosing them to the client — in the block message and via the `x-dq-gate-score` header — by setting `discloseScoreDetails: true`, but that lets clients probe threshold boundaries, so it is off by default.
+
+When a connector call fails with a DQ Gate block, **do not expose raw scores or thresholds** in the response even if disclosure is enabled. Instead, explain the block in plain language, for example:
 
 > "Property B is blocked by the DQ Gate — the data quality for this source didn't meet the required standard, so results from it cannot be shown."
 

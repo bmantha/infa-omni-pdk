@@ -21,6 +21,8 @@ pub struct Config {
     pub cdgc_org_password: String,
     #[serde(alias = "cdgcOrgUsername")]
     pub cdgc_org_username: String,
+    #[serde(alias = "discloseScoreDetails")]
+    pub disclose_score_details: Option<bool>,
     #[serde(alias = "distributed")]
     pub distributed: Option<bool>,
     #[serde(alias = "failOpenOnCdgcError")]

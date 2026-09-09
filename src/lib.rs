@@ -197,15 +197,26 @@ fn parse_jsonrpc_call(body: &[u8]) -> Option<(String, Option<Value>)> {
 /// `200` is intentional: JSON-RPC errors are protocol-level, not transport-level, so an MCP
 /// client expects `200` + an `error` object here, not an HTTP 4xx.
 fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) -> Response {
-    let message = match score {
-        Some(score) => format!(
-            "Blocked by DQ Gate: asset '{}' DQ score {score:.2} is below blockThreshold {:.2}",
-            config.cdgc_asset_id, config.block_threshold
-        ),
-        None => format!(
-            "Blocked by DQ Gate: no DQ score is available yet for asset '{}'",
-            config.cdgc_asset_id
-        ),
+    // `discloseScoreDetails` (default false) controls whether internal governance state -- the
+    // exact score, `blockThreshold`, and `cdgcAssetId` -- is revealed to the MCP client. Off by
+    // default so a client can't probe threshold boundaries or learn asset identifiers; the full
+    // detail is always recorded server-side by the `warn!` in `request_filter` regardless (#7).
+    let disclose = config.disclose_score_details.unwrap_or(false);
+
+    let message = if disclose {
+        match score {
+            Some(score) => format!(
+                "Blocked by DQ Gate: asset '{}' DQ score {score:.2} is below blockThreshold {:.2}",
+                config.cdgc_asset_id, config.block_threshold
+            ),
+            None => format!(
+                "Blocked by DQ Gate: no DQ score is available yet for asset '{}'",
+                config.cdgc_asset_id
+            ),
+        }
+    } else {
+        "Blocked by DQ Gate: data quality for the requested source did not meet the required standard"
+            .to_string()
     };
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -214,9 +225,12 @@ fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) ->
     });
 
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
-    if let Some(score) = score {
-        headers.push((HEADER_DQ_SCORE.to_string(), format!("{score:.2}")));
+    if disclose {
+        if let Some(score) = score {
+            headers.push((HEADER_DQ_SCORE.to_string(), format!("{score:.2}")));
+        }
     }
+    // The coarse status is always safe to surface for downstream annotation.
     headers.push((HEADER_DQ_STATUS.to_string(), "blocked".to_string()));
 
     Response::new(200)
@@ -538,6 +552,11 @@ async fn request_filter<S: DataStorage>(
 
     let score = resolve_score(client, config, score_store, lock_store).await;
 
+    // Only surface the raw numeric score to the client (via the x-dq-gate-score header on an
+    // allowed response) when explicitly opted in; the coarse status header is always emitted. See
+    // `block_response` for the corresponding block-path behavior (#7).
+    let disclose = config.disclose_score_details.unwrap_or(false);
+
     match score {
         None => {
             if config.block_on_unknown_score.unwrap_or(false) {
@@ -568,9 +587,9 @@ async fn request_filter<S: DataStorage>(
                 config.cdgc_asset_id,
                 config.warn_threshold
             );
-            Flow::Continue(DqGateData::Evaluated { score: Some(score), status: "warn" })
+            Flow::Continue(DqGateData::Evaluated { score: disclose.then_some(score), status: "warn" })
         }
-        Some(score) => Flow::Continue(DqGateData::Evaluated { score: Some(score), status: "ok" }),
+        Some(score) => Flow::Continue(DqGateData::Evaluated { score: disclose.then_some(score), status: "ok" }),
     }
 }
 
@@ -728,7 +747,8 @@ mod test {
 
         assert_eq!(response.status_code(), 200);
         assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
-        assert_eq!(response.header("x-dq-gate-score"), Some("95.00"));
+        // The raw score is NOT disclosed to the client by default (discloseScoreDetails=false).
+        assert_eq!(response.header("x-dq-gate-score"), None);
         assert!(backend.next().is_some());
     }
 
@@ -747,12 +767,62 @@ mod test {
         let response = tester.request(mcp_request(42));
 
         assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        // Default (discloseScoreDetails=false): no raw score header, generic message, and no
+        // score/threshold/asset id leaked to the client.
+        assert_eq!(response.header("x-dq-gate-score"), None);
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 42);
         assert_eq!(body["error"]["code"], -32008);
-        assert!(body["error"]["message"].as_str().unwrap().contains("blockThreshold"));
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("did not meet the required standard"), "got: {}", msg);
+        assert!(!msg.contains("blockThreshold"), "must not leak threshold: {}", msg);
+        assert!(!msg.contains("asset-1"), "must not leak asset id: {}", msg);
+        assert!(!msg.contains("50"), "must not leak score: {}", msg);
         // The MCP server backend must never be invoked for a blocked request.
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn disclose_true_emits_score_header_on_allowed_response() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "discloseScoreDetails": true })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(1));
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
+        // Opt-in: the raw score IS surfaced to the client when discloseScoreDetails=true.
+        assert_eq!(response.header("x-dq-gate-score"), Some("95.00"));
+    }
+
+    #[test]
+    fn disclose_true_block_message_includes_score_and_threshold() {
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "discloseScoreDetails": true })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(3));
+
+        assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        assert_eq!(response.header("x-dq-gate-score"), Some("50.00"));
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("blockThreshold"), "got: {}", msg);
+        assert!(msg.contains("asset-1"), "got: {}", msg);
         assert!(backend.next().is_none());
     }
 
