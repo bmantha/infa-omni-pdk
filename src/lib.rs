@@ -342,11 +342,10 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
         .map_err(|err| anyhow!("CDGC login failed: {err}"))?;
 
     if login_response.status_code() >= 300 {
-        return Err(anyhow!(
-            "CDGC login returned {}: {}",
-            login_response.status_code(),
-            String::from_utf8_lossy(login_response.body())
-        ));
+        // Status code only -- NEVER the response body. The Login endpoint echoes a `sessionId`
+        // (and other credential detail) in its payload, and errors here propagate verbatim into
+        // `logger::warn!`, which is lower-trust than the secret store (see #6 / pdk-policy-logging).
+        return Err(anyhow!("CDGC login returned status {}", login_response.status_code()));
     }
     let login: CdgcLoginResponse = serde_json::from_slice(login_response.body())
         .map_err(|err| anyhow!("Failed to parse CDGC login response: {err}"))?;
@@ -366,11 +365,8 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
         .map_err(|err| anyhow!("CDGC JWT fetch failed: {err}"))?;
 
     if jwt_response.status_code() >= 300 {
-        return Err(anyhow!(
-            "CDGC JWT fetch returned {}: {}",
-            jwt_response.status_code(),
-            String::from_utf8_lossy(jwt_response.body())
-        ));
+        // Status code only -- the Token endpoint returns JWT material in its body; keep it out of logs.
+        return Err(anyhow!("CDGC JWT fetch returned status {}", jwt_response.status_code()));
     }
     let jwt: CdgcJwtResponse = serde_json::from_slice(jwt_response.body())
         .map_err(|err| anyhow!("Failed to parse CDGC JWT response: {err}"))?;
@@ -394,11 +390,9 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config) -> Result<f64> {
         .map_err(|err| anyhow!("CDGC DQ score fetch failed: {err}"))?;
 
     if detail_response.status_code() >= 300 {
-        return Err(anyhow!(
-            "CDGC DQ score fetch returned {}: {}",
-            detail_response.status_code(),
-            String::from_utf8_lossy(detail_response.body())
-        ));
+        // Status code only -- the Detail response can carry org/asset metadata we don't want in
+        // logs. Not a token endpoint, but the same secret-in-logs anti-pattern (#6).
+        return Err(anyhow!("CDGC DQ score fetch returned status {}", detail_response.status_code()));
     }
     let detail: AssetDetailResponse = serde_json::from_slice(detail_response.body())
         .map_err(|err| anyhow!("Failed to parse CDGC asset detail response: {err}"))?;
