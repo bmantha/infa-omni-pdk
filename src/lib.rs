@@ -461,9 +461,19 @@ async fn request_filter<S: DataStorage>(
     score_store: &S,
     lock_store: &S,
 ) -> Flow<DqGateData> {
-    let headers_state = request_state.into_headers_state().await;
-    let body_state = headers_state.into_body_state().await;
-    let body = body_state.handler().body();
+    // Atomically buffer request headers AND body before deciding. The split
+    // into_headers_state() -> into_body_state() path releases headers to Envoy's router, which
+    // begins proxying the request upstream in parallel while we compute the score -- so a blocked
+    // tools/call could still reach and execute on the upstream MCP server, and the upstream
+    // response could race our synthetic Flow::Break. The combined state holds the request in the
+    // filter until we decide, so Flow::Break always wins (see #2). The known response-leg hang
+    // with this combined state does not apply here -- this is the request leg.
+    let state = request_state.into_headers_body_state().await;
+    let body = if state.contains_body() {
+        state.handler().body()
+    } else {
+        Vec::new()
+    };
     let rpc_id = extract_jsonrpc_id(&body);
     let method = extract_jsonrpc_method(&body);
 

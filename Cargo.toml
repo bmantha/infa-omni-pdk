@@ -14,14 +14,19 @@ definition_asset_id = "dq-gate-policy"
 implementation_asset_id = "dq-gate-policy-flex"
 
 [dependencies]
-pdk = { version = "1.10.0" }
+# enable_stop_iteration: lets request_filter buffer request headers + body atomically via
+# into_headers_body_state(), so a blocked tools/call is never forwarded upstream (see #2).
+pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 anyhow = "1.0"
 
 [dev-dependencies]
 pdk-test = { version = "1.10.0" }
-pdk-unit = { version = "1.10.0" }
+# enable_stop_iteration must mirror the pdk dependency's feature: it flips the pdk-unit tester's
+# default stop mode to BodyThenRequests so a paused headers event buffers the body and
+# into_headers_body_state() resolves. Without it the combined-state await spins forever (see #2).
+pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
 httpmock = "0.6"
 reqwest = { version = "0.11", features = ["json"] }
 
