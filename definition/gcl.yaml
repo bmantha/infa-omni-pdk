@@ -3,16 +3,15 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: dq-gate-policy
-    category: Custom
+    title: IDMC Data Quality Gate
+    category: Quality of Service
     description: >-
-      Policy gates agent/MCP tool calls on a CDGC-governed asset's current data
-      quality score, warning or blocking requests when quality drops below
-      configurable thresholds. The score is cached in native gateway data storage
-      with a long TTL (CDGC DQ scans run roughly daily) and refreshed lazily,
-      inline, by whichever request happens to see a stale cache entry — so almost
-      every request is a fast local cache read, not a live CDGC call.
+      Gates agent/MCP tool calls on a CDGC-governed asset's current data quality
+      score, warning or blocking requests when the score falls below configurable
+      thresholds. The score is cached and refreshed lazily, so most requests are a
+      fast local read.
     metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
 spec:
   extends:
@@ -34,6 +33,9 @@ spec:
     cdgcOrgUsername:
       type: string
       description: IDMC service-account username used to authenticate to CDGC.
+      "@context":
+        "@characteristics":
+          - security:sensitive
     cdgcOrgPassword:
       type: string
       description: IDMC service-account password.
