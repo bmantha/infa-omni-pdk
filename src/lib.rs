@@ -523,6 +523,12 @@ async fn request_filter<S: DataStorage>(
 }
 
 async fn response_filter(response_state: ResponseState, request_data: RequestData<DqGateData>) {
+    // Complete at header state and do NOT transition to body state. This filter only annotates two
+    // diagnostic response headers; it never needs the body. Forcing into_body_state() would buffer
+    // the entire response before releasing it downstream, which stalls MCP Streamable-HTTP
+    // (text/event-stream) responses -- a long-lived or never-terminating event stream would never
+    // flush to the client (bounded by the Envoy per-connection buffer). Header-only completion is
+    // valid in PDK response filters and passes the body through untouched as a stream.
     let headers_state = response_state.into_headers_state().await;
 
     if let RequestData::Continue(DqGateData::Evaluated { score, status }) = request_data {
@@ -531,8 +537,6 @@ async fn response_filter(response_state: ResponseState, request_data: RequestDat
         }
         headers_state.handler().set_header(HEADER_DQ_STATUS, status);
     }
-
-    headers_state.into_body_state().await;
 }
 
 /// Wires the request/response filters against a concrete [`DataStorage`] backend. Kept generic over
