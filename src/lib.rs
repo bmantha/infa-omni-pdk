@@ -55,7 +55,6 @@ const DEFAULT_TIMEOUT_MS: i64 = 5_000;
 /// the previous ~180s worst case (three 60s calls).
 const CDGC_REFRESH_BUDGET_MS: i64 = 10_000;
 const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
-const CDGC_JWT_NONCE: &str = "1234";
 /// JSON-RPC error code returned when a request is blocked. Chosen from the JSON-RPC 2.0
 /// server-defined reserved range (`-32000..=-32099`) and deliberately NOT `-32000`, which collides
 /// with the common router/proxy "path or method not found" convention; `-32008` is this policy's
@@ -166,6 +165,36 @@ fn unix_seconds(time: SystemTime) -> i64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Percent-encodes `value` for safe interpolation into a URL path segment or query value. Everything
+/// outside the RFC 3986 "unreserved" set (`A-Z a-z 0-9 - _ . ~`) is escaped as `%XX` on a UTF-8 byte
+/// basis. PDK's request builder takes the path/query string verbatim and performs no encoding, and
+/// no third-party URL crate is pulled in (prefer-PDK / minimal-deps rules), so this small encoder
+/// prevents an asset id or nonce containing `?`, `#`, `/`, `&`, `=`, or whitespace from altering the
+/// request target or injecting query parameters (#12).
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Derives a per-request JWT nonce from a [`Clock`] reading: the nanoseconds elapsed since the Unix
+/// epoch, as a decimal string. A nonce is a replay-protection primitive that must be unique per
+/// request, so this replaces the former hardcoded constant. Uniqueness is guaranteed in practice
+/// because the stampede refresh lock serialises refreshes per asset per replica, and each fires at a
+/// distinct nanosecond (#12).
+fn nonce_from_time(now: SystemTime) -> String {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn score_cache_key(config: &Config) -> String {
@@ -410,7 +439,10 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -
     let login: CdgcLoginResponse = serde_json::from_slice(login_response.body())
         .map_err(|err| anyhow!("Failed to parse CDGC login response: {err}"))?;
 
-    let jwt_path = format!("/identity-service/api/v1/jwt/Token?client_id=idmc_api&nonce={CDGC_JWT_NONCE}");
+    // Unique per-request nonce (from the injected Clock), percent-encoded into the query. Encoding a
+    // purely numeric nonce is a no-op today but guards the query if the derivation ever changes.
+    let nonce = percent_encode(&nonce_from_time(clock.now()));
+    let jwt_path = format!("/identity-service/api/v1/jwt/Token?client_id=idmc_api&nonce={nonce}");
     let cookie = format!("USER_SESSION={}", login.session_id);
     let jwt_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
         anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before JWT fetch")
@@ -434,9 +466,11 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -
     let jwt: CdgcJwtResponse = serde_json::from_slice(jwt_response.body())
         .map_err(|err| anyhow!("Failed to parse CDGC JWT response: {err}"))?;
 
+    // Percent-encode the asset id: it is interpolated into the path *segment* before the query, so
+    // an id containing `?`, `#`, `/`, or whitespace would otherwise alter the request target.
     let detail_path = format!(
         "/data360/search/v1/assets/{}?scheme=internal&segments=dataQuality",
-        config.cdgc_asset_id
+        percent_encode(&config.cdgc_asset_id)
     );
     let authorization = format!("Bearer {}", jwt.jwt_token);
     let detail_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
@@ -1311,5 +1345,30 @@ mod test {
         assert_eq!(super::next_call_timeout(super::DEFAULT_TIMEOUT_MS, budget), None);
         // Past the budget: also abort (no unbounded blocking).
         assert_eq!(super::next_call_timeout(super::DEFAULT_TIMEOUT_MS, budget + 5_000), None);
+    }
+
+    // --- #12 CDGC request-construction hardening tests ---
+
+    #[test]
+    fn percent_encode_escapes_reserved_and_preserves_unreserved() {
+        // Unreserved set passes through untouched.
+        assert_eq!(super::percent_encode("abcXYZ0189-_.~"), "abcXYZ0189-_.~");
+        // Characters that would alter a URL target or inject query params are escaped.
+        assert_eq!(super::percent_encode("a/b?c#d&e=f g"), "a%2Fb%3Fc%23d%26e%3Df%20g");
+        // Multi-byte UTF-8 is encoded byte-wise.
+        assert_eq!(super::percent_encode("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn nonce_from_time_is_unique_per_distinct_reading_and_not_constant() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_nanos(1_700_000_000_000_000_123);
+        let later = base + Duration::from_nanos(1);
+        let a = super::nonce_from_time(base);
+        let b = super::nonce_from_time(later);
+        // Distinct clock readings must yield distinct nonces (not a fixed constant).
+        assert_ne!(a, b);
+        assert_ne!(a, "1234");
+        // Nonce is a decimal nanosecond count.
+        assert!(a.bytes().all(|c| c.is_ascii_digit()), "nonce must be numeric: {}", a);
     }
 }
