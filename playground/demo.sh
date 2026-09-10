@@ -235,8 +235,8 @@ echo ""
 RESP_A=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8081/anything/mcp/ \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
-BODY_A=$(echo "$RESP_A" | head -n -1)
-CODE_A=$(echo "$RESP_A" | tail -n 1)
+BODY_A="${RESP_A%$'\n'*}"   # strip trailing "\n<http_code>" (portable; macOS head lacks -n -1)
+CODE_A="${RESP_A##*$'\n'}"
 
 echo "  HTTP $CODE_A"
 echo "  Body: $BODY_A" | head -c 300
@@ -256,8 +256,8 @@ echo ""
 RESP_B=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8082/anything/mcp/ \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
-BODY_B=$(echo "$RESP_B" | head -n -1)
-CODE_B=$(echo "$RESP_B" | tail -n 1)
+BODY_B="${RESP_B%$'\n'*}"
+CODE_B="${RESP_B##*$'\n'}"
 
 echo "  HTTP $CODE_B"
 echo "  Body: $BODY_B" | head -c 300
@@ -276,10 +276,11 @@ echo ""
 header "Bonus: mutate Stack B score live (65 → 95) and retry"
 info "Pushing new score to cdgcapi-b mock..."
 
+# The mock runs on python:3.12-alpine — its BusyBox wget can't do PUT, so drive the
+# PUT /score endpoint with the python3 that's already in the image (urllib, stdlib only).
 $DC -f "$COMPOSE_FILE" exec -T cdgcapi-b \
-  sh -c 'wget -q -O- --method=PUT --body-data="{\"score\":95}" \
-    --header="Content-Type: application/json" http://localhost/score' || \
-  warn "Could not push score via exec — try manually: docker exec <cdgcapi-b> ..."
+  python3 -c 'import json,urllib.request; req=urllib.request.Request("http://localhost/score", data=json.dumps({"score":95}).encode(), method="PUT", headers={"Content-Type":"application/json"}); print(urllib.request.urlopen(req).read().decode())' || \
+  warn "Could not push score via exec — try manually: docker exec <cdgcapi-b> python3 ..."
 
 info "Waiting ${BOLD}31s${NC} for cache TTL (refreshIntervalSeconds=30) to expire..."
 sleep 31
@@ -288,8 +289,8 @@ info "Retrying Stack B after score update..."
 RESP_B2=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8082/anything/mcp/ \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
-CODE_B2=$(echo "$RESP_B2" | tail -n 1)
-BODY_B2=$(echo "$RESP_B2" | head -n -1)
+CODE_B2="${RESP_B2##*$'\n'}"
+BODY_B2="${RESP_B2%$'\n'*}"
 
 echo "  HTTP $CODE_B2"
 echo "  Body: $BODY_B2" | head -c 300
