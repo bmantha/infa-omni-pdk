@@ -5,3 +5,4 @@ playground/config/custom-policies/*
 registration.yaml
 certificate.yaml
 .env
+.envrc
