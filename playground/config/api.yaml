@@ -23,7 +23,7 @@ spec:
         cdgcOrgPassword: dummy-cdgc-password
         cdgcAssetId: demo-asset-1
         warnThreshold: 90
-        blockThreshold: 70
+        blockThreshold: 80
         scoreAggregation: min
         # Shortened from the real-world 86400s (24h) default so a `PUT /score` against the
         # cdgcapi mock (see mocks/mock_server.py) is visible within a demo-friendly window,

@@ -59,7 +59,7 @@ spec:
       type: number
       minimum: 0
       maximum: 100
-      default: 70
+      default: 80
       description: >-
         If the asset's current DQ score is below this value, the request is
         rejected before it reaches the upstream MCP server.

@@ -1,9 +1,53 @@
-# "dq-gate-policy" Policy
+# IDMC Data Quality Gate
 
-Design brief and CDGC integration details: see `../../ai-governance/README.md`.
+A MuleSoft Flex/Omni Gateway custom policy that gates inbound MCP tool-invocation traffic on the
+current **data-quality (DQ) score** of a CDGC-governed asset in Informatica IDMC. It is written in
+Rust with the [Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview)
+and compiled to WebAssembly (`wasm32-wasip1`).
 
-This policy was created with the Flex Gateway Policy Development Kit (PDK). To find the complete PDK documentation, see [PDK Overview](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview) on the Mulesoft documentation site.
+## What it does
 
+For each gated MCP JSON-RPC call (`tools/call`, `resources/read`, `prompts/get`), the policy compares
+the monitored asset's DQ score against two configurable thresholds and acts before the request
+reaches the upstream MCP server:
+
+| Score vs. thresholds | Outcome |
+|---|---|
+| ≥ `warnThreshold` | Allowed (`x-dq-gate-status: ok`) |
+| ≥ `blockThreshold`, `< warnThreshold` | Allowed with a warning (`x-dq-gate-status: warn`) |
+| `< blockThreshold` | Rejected with a JSON-RPC error (`-32008`); a PolicyViolation is reported |
+
+Defaults are `warnThreshold: 90` / `blockThreshold: 80`.
+
+### CDGC / IDMC integration
+
+The DQ score is retrieved from CDGC via a short inline chain — IDMC **Login** → **JWT** → asset
+**detail** — using a service-account credential. Multiple DQ dimensions are combined into one score by
+`scoreAggregation` (`min`, the conservative default, or `average`). The whole chain is bounded by a
+per-call `timeout` and an overall hot-path latency budget, so a slow or failing CDGC never blocks an
+agent call unbounded.
+
+### Caching
+
+Scores are cached in **PDK-native `DataStorage`** and refreshed lazily on a TTL (`refreshIntervalSeconds`,
+default 24h — CDGC DQ scans run roughly daily), so the vast majority of requests are a fast local read
+with no CDGC round-trip. Set `distributed: true` to share the cache and refresh lock across gateway
+replicas via gossip-replicated storage; the default keeps per-replica in-memory state.
+
+### Safety posture
+
+- **Fail-open recognition:** only genuine MCP JSON-RPC calls are gated. Non-POST requests, non-JSON
+  bodies, handshake/discovery methods, notifications, and JSON-RPC batches pass through ungated, so the
+  policy never breaks non-MCP traffic or connection setup.
+- **Fail-closed on the unknown:** when no score is available at all (cold start, or a CDGC outage with
+  an empty cache), the gate blocks by default (`blockOnUnknownScore: true`). A deliberate soft launch can
+  set it `false`; the bypass window is logged once per worker.
+- **No client disclosure by default:** raw scores, thresholds, and the asset id are logged server-side
+  only. `discloseScoreDetails: true` opts into surfacing them to the client.
+
+Every configurable property is declared in [`definition/gcl.yaml`](definition/gcl.yaml). See
+[`AGENTS.md`](AGENTS.md) for the design rationale and [`playground/`](playground/) for a self-contained
+two-stack (pass vs. block) local demo.
 
 ## Make command reference
 This project has a Makefile that includes different goals that assist the developer during the policy development lifecycle.

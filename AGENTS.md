@@ -68,8 +68,8 @@ The policy is wired to two MCP connectors in Claude Desktop that share the same 
 
 | Connector | Asset DQ score | blockThreshold | Expected result |
 |---|---|---|---|
-| `parks-guests-mcp` | 90 | 80 | ✅ allowed |
-| `parks-guests-b-mcp` | 70.26 | 80 | ❌ blocked by DQ gate |
+| `parks-guests-mcp` | 95 | 80 | ✅ allowed |
+| `parks-guests-b-mcp` | 65 | 80 | ❌ blocked by DQ gate |
 
 To run the demo, simply ask Claude to call both connectors (e.g. "look up guests checking out today"). The gate rejects the low-score connector inline and returns a generic block error — by default it does **not** disclose the score, threshold, or asset id to the client — no Docker or local Flex Gateway needed.
 
