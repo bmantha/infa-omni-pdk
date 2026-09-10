@@ -12,9 +12,12 @@ DEFINITION_GCL_PATH    	= $(shell anypoint-cli-v4 pdk policy-project locate-gcl 
 CRATE_NAME             	= $(shell cargo anypoint get-name)
 SETUP_ERROR_CMD        	= (echo "ERROR:\n\tMissing custom policy project setup. Please run 'make setup'\n")
 FLEX_IMAGE              := mulesoft/flex-gateway:1.13.0
-# When true, publish/release skip re-publishing the definition if its content matches the version
-# already in Exchange, pointing the implementation dependency at that published definition instead.
-SKIP_UNCHANGED_DEFINITION ?= true
+# Only appended to publish/release when set to a non-empty value. Left empty by default because the
+# --skip-unchanged-definition flag is supported only by newer anypoint-cli-v4 releases; the P4A build
+# pipeline's CLI rejects it ("Unexpected argument"), so the default MUST omit the flag entirely.
+# Opt in on a compatible CLI with e.g. `make publish SKIP_UNCHANGED_DEFINITION=true`.
+SKIP_UNCHANGED_DEFINITION ?=
+_SKIP_UNCHANGED_DEFINITION_FLAG = $(if $(strip $(SKIP_UNCHANGED_DEFINITION)),--skip-unchanged-definition=$(strip $(SKIP_UNCHANGED_DEFINITION)),)
 
 ifeq ($(OS), Windows_NT)
     SHELL = powershell.exe
@@ -78,11 +81,11 @@ test-coverage: build tests/config/registration.yaml ## Run tests with coverage. 
 
 .PHONY: publish
 publish: build ## Publish a development version of the policy
-	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml --skip-unchanged-definition=$(SKIP_UNCHANGED_DEFINITION)
+	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml $(_SKIP_UNCHANGED_DEFINITION_FLAG)
 
 .PHONY: release
 release: build ## Publish a release version
-	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml --skip-unchanged-definition=$(SKIP_UNCHANGED_DEFINITION)
+	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml $(_SKIP_UNCHANGED_DEFINITION_FLAG)
 
 .PHONY: build-asset-files
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
