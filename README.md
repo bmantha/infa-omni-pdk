@@ -16,31 +16,39 @@ invocations are gated:
 - **A2A** message-send invocations — across **both A2A v0.3.0 and v1.0** and both transports:
   - the JSON-RPC send methods: `message/send` / `message/stream` (v0.3.0) and
     `SendMessage` / `SendStreamingMessage` (v1.0);
-  - the A2A HTTP+JSON (REST) send binding (a path ending in `message:send`), with the protocol version
-    taken from the `A2A-Version` request header.
+  - the A2A HTTP+JSON (REST) send binding (a path ending in `message:send`) — a v1.0-only surface.
 
 The score decision is identical for both protocols; only the **rejection shape** differs so each
 client sees a protocol-conformant error (see below):
 
-| Score vs. thresholds | MCP outcome | A2A outcome |
-|---|---|---|
-| ≥ `warnThreshold` | Allowed (`x-dq-gate-status: ok`) | Allowed (`x-dq-gate-status: ok`) |
-| ≥ `blockThreshold`, `< warnThreshold` | Allowed with a warning (`x-dq-gate-status: warn`) | Allowed with a warning (`x-dq-gate-status: warn`) |
-| `< blockThreshold` | HTTP 200 + JSON-RPC error `-32008` | HTTP 403 + JSON-RPC error `-32010` |
+| Score vs. thresholds | MCP outcome | A2A JSON-RPC outcome | A2A REST outcome |
+|---|---|---|---|
+| ≥ `warnThreshold` | Allowed (`x-dq-gate-status: ok`) | Allowed (`x-dq-gate-status: ok`) | Allowed (`x-dq-gate-status: ok`) |
+| ≥ `blockThreshold`, `< warnThreshold` | Allowed + warning (`warn`) | Allowed + warning (`warn`) | Allowed + warning (`warn`) |
+| `< blockThreshold` | HTTP 200 + JSON-RPC `-32008` | HTTP 200 + JSON-RPC `-32010` (in-band) | HTTP 403 + `google.rpc.Status` |
 
 A PolicyViolation is reported on every block. Defaults are `warnThreshold: 90` / `blockThreshold: 80`.
 
 ### Protocol-conformant A2A rejections
 
-MCP treats a JSON-RPC error as protocol-level, so an MCP block is **HTTP 200** carrying error `-32008`.
-An A2A rejection is instead a transport-level **HTTP 403** carrying JSON-RPC error code **`-32010`** —
-chosen to sit *outside* A2A's own reserved band (`-32001..=-32009`, which already assigns `-32008` to
+Both MCP and the A2A **JSON-RPC** binding treat a JSON-RPC error as protocol-level, so the block is
+carried **in-band on HTTP 200** inside the JSON-RPC envelope (returning an HTTP 4xx for a well-formed
+JSON-RPC call is a spec mistake). MCP uses error code `-32008`; A2A uses **`-32010`** — chosen to sit
+*outside* A2A's own reserved band (`-32001..=-32009`, which already assigns `-32008` to
 `ExtensionSupportRequiredError` and `-32009` to `VersionNotSupportedError` in v1.0), so it never
-collides with a real A2A error. On **A2A v1.0** the `error.data` carries a
-[`google.rpc.ErrorInfo`](https://cloud.google.com/apis/design/errors) (`reason:
-DATA_QUALITY_BELOW_THRESHOLD`, `domain: dq-gate.mulesoft.com`); on **v0.3.0** `error.data` is free-form
-(populated only when `discloseScoreDetails` is on). The same body is returned for both A2A transports —
-a REST send-binding client keys on the `403`, and the JSON-RPC-shaped body is harmless extra detail.
+collides with a real A2A error. On the A2A JSON-RPC binding the `error.data` shape is version-specific:
+
+- **A2A v1.0** — `error.data` is a **single-element array** carrying a
+  [`google.rpc.ErrorInfo`](https://cloud.google.com/apis/design/errors) (`reason:
+  DATA_QUALITY_BELOW_THRESHOLD`, `domain: dq-gate.mulesoft.com`), the structured form v1.0 expects.
+- **A2A v0.3.0 (Legacy)** — `error.data` is free-form and included only when `discloseScoreDetails` is
+  on (Legacy predates the structured `ErrorInfo` binding).
+
+The A2A **HTTP+JSON (REST)** send binding is different: it is not a JSON-RPC envelope, so it answers
+with a **native HTTP 403** and a [`google.rpc.Status`](https://cloud.google.com/apis/design/errors)
+body — `{"error":{"code":403,"message":…,"details":[ErrorInfo]}}` with `error.code` mirroring the HTTP
+status and no JSON-RPC envelope. The `ErrorInfo` in `details` is the same one the v1.0 JSON-RPC block
+carries in `data`.
 
 A2A **housekeeping** methods — task management, push-notification config, and agent-card discovery
 (`tasks/*`, `agent/*` in v0.3.0; `GetTask`, `ListTasks`, `*PushNotificationConfig*`, `GetAgentCard`, …

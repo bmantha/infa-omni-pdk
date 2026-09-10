@@ -63,19 +63,21 @@ const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
 /// unknown-score).
 const JSONRPC_BLOCK_ERROR_CODE: i64 = -32008;
 
-/// JSON-RPC error code returned when an **A2A** invocation is blocked. It MUST differ from the MCP
-/// code above: A2A defines its own errors in the JSON-RPC server-defined reserved range
-/// (`-32000..=-32099`), occupying `-32001..=-32009` (e.g. `-32008` = `ExtensionSupportRequiredError`,
-/// `-32009` = `VersionNotSupportedError`, confirmed against the A2A spec at tags v0.3.0 / v1.0.0). A2A
-/// has no dedicated "blocked by gateway policy" code, and the spec explicitly permits servers to mint
-/// their own codes in that band. `-32010` is the first slot *outside* A2A's assigned range, so it can
-/// never collide with an A2A-defined code -- whereas reusing the MCP `-32008` here would collide with
-/// A2A's `ExtensionSupportRequiredError`.
+/// JSON-RPC error code returned when an **A2A** invocation is blocked on the JSON-RPC binding. It MUST
+/// differ from the MCP code above: A2A mints its own errors in the JSON-RPC server-defined reserved
+/// range (`-32000..=-32099`) and has so far assigned `-32001..=-32009` (e.g. `-32008` =
+/// `ExtensionSupportRequiredError`, `-32009` = `VersionNotSupportedError`, per the A2A spec at tags
+/// v0.3.0 / v1.0.0). A2A has no dedicated "blocked by gateway policy" code, and the spec explicitly
+/// permits servers to mint their own within that reserved range. `-32010` is the first slot *above*
+/// A2A's currently-assigned codes, so it can never collide with an A2A-defined one -- whereas reusing
+/// the MCP `-32008` here would collide with A2A's `ExtensionSupportRequiredError`.
 const A2A_BLOCK_ERROR_CODE: i64 = -32010;
-/// A2A blocks return HTTP 403 (Forbidden) -- the request is well-formed but denied by policy -- which
-/// both A2A versions list as a valid status. This is deliberately different from the MCP block, which
-/// stays HTTP 200 with the error carried purely in the JSON-RPC envelope (the MCP transport convention).
-const A2A_BLOCK_HTTP_STATUS: u32 = 403;
+/// The A2A **HTTP+JSON (REST)** binding block returns this native HTTP status (Forbidden -- the request
+/// is well-formed but denied by policy), carrying a `google.rpc.Status` body (pdk-a2a Shape 3). The A2A
+/// **JSON-RPC** binding block, by contrast, stays HTTP 200 with the error carried in-band in the
+/// JSON-RPC envelope -- the JSON-RPC transport convention shared with MCP; only the code (`-32010`) and,
+/// on v1.0, the `google.rpc.ErrorInfo` `data` array distinguish it from an MCP block.
+const A2A_REST_BLOCK_HTTP_STATUS: u32 = 403;
 /// `google.rpc.ErrorInfo.reason` (UPPER_SNAKE_CASE, no "Error" suffix, per the convention) carried on
 /// an A2A v1.0 block.
 const A2A_ERROR_REASON: &str = "DATA_QUALITY_BELOW_THRESHOLD";
@@ -83,12 +85,6 @@ const A2A_ERROR_REASON: &str = "DATA_QUALITY_BELOW_THRESHOLD";
 /// domain identifies errors defined *by the A2A protocol itself*; this is a policy-owned domain
 /// identifying the DQ Gate as the service that produced the error.
 const A2A_ERROR_DOMAIN: &str = "dq-gate.mulesoft.com";
-/// Header carrying the A2A protocol version. Present (value `1.0`) only from v1.0 clients; the spec's
-/// fallback rule is that an absent/empty value means v0.3. Used only for the REST binding, where there
-/// is no JSON-RPC `method` string to read the version from (for JSON-RPC the method vocabulary itself
-/// is version-unambiguous -- see [`classify_jsonrpc_method`]).
-const HEADER_A2A_VERSION: &str = "a2a-version";
-
 const HEADER_DQ_SCORE: &str = "x-dq-gate-score";
 const HEADER_DQ_STATUS: &str = "x-dq-gate-status";
 
@@ -338,22 +334,35 @@ fn parse_jsonrpc_call(body: &[u8]) -> Option<(String, Option<Value>)> {
     Some((method, id))
 }
 
-/// The A2A protocol version of a gated A2A request. Governs only the *shape* of a block response
-/// (v1.0 must carry a `google.rpc.ErrorInfo`; v0.3.0's `error.data` is free-form) -- the score and
-/// threshold logic is identical for both. For JSON-RPC it is read straight off the (version-disjoint)
-/// method name; for the REST binding, where there is no method string, from the `A2A-Version` header.
+/// The A2A protocol version of a request gated on the **JSON-RPC** binding. Governs only the *shape* of
+/// that binding's `error.data`: v1.0 carries a single-element `google.rpc.ErrorInfo` array, v0.3.0
+/// (Legacy) a free-form string. Read straight off the (version-disjoint) method name. The REST binding
+/// does not use this -- A2A's HTTP+JSON binding is a v1.0 surface with a single (version-independent)
+/// `google.rpc.Status` rejection shape.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum A2aVersion {
     V0_3,
     V1_0,
 }
 
+/// The A2A transport binding a *gated* A2A request arrived on -- selects the rejection shape, per the
+/// `pdk-a2a` convention: the JSON-RPC binding answers in-band at HTTP 200; the HTTP+JSON (REST) binding
+/// answers with a native HTTP status and a `google.rpc.Status` body (no JSON-RPC envelope).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum A2aBinding {
+    /// JSON-RPC 2.0 over POST (Legacy v0.3.0 and V1). Version selects the `error.data` shape.
+    JsonRpc(A2aVersion),
+    /// HTTP+JSON (REST) message-send binding (`/message:send`, ...). A2A v1.0 surface; Shape 3.
+    Rest,
+}
+
 /// The wire protocol a *gated* request arrived on. Selects the block-response shape: MCP → HTTP 200 +
-/// JSON-RPC `-32008`; A2A → HTTP 403 + JSON-RPC `-32010` (with an `ErrorInfo` on v1.0).
+/// JSON-RPC `-32008`; A2A JSON-RPC → HTTP 200 + JSON-RPC `-32010` (a `[google.rpc.ErrorInfo]` `data`
+/// array on v1.0); A2A REST → native HTTP 403 + a `google.rpc.Status` body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GateProtocol {
     Mcp,
-    A2a(A2aVersion),
+    A2a(A2aBinding),
 }
 
 /// Classification of a recognized request: gate it on the given protocol's terms, or pass it through
@@ -371,8 +380,12 @@ enum RequestClass {
 /// unrecognized method -- is gated as MCP, preserving the MCP-only design's fail-closed default.
 fn classify_jsonrpc_method(method: &str) -> RequestClass {
     match method {
-        A2A_V03_SEND | A2A_V03_STREAM => RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3)),
-        A2A_V1_SEND | A2A_V1_STREAM => RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0)),
+        A2A_V03_SEND | A2A_V03_STREAM => {
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V0_3)))
+        }
+        A2A_V1_SEND | A2A_V1_STREAM => {
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V1_0)))
+        }
         _ if A2A_HOUSEKEEPING_METHODS.contains(&method) => RequestClass::Exempt,
         _ if EXEMPT_METHODS.contains(&method) => RequestClass::Exempt,
         _ => RequestClass::Gated(GateProtocol::Mcp),
@@ -381,11 +394,11 @@ fn classify_jsonrpc_method(method: &str) -> RequestClass {
 
 /// Recognizes the A2A HTTP+JSON (REST) *message-send* binding from the request path, for the transport
 /// where the body is a bare `SendMessageRequest`/`MessageSendParams` (no JSON-RPC envelope, so
-/// [`parse_jsonrpc_call`] returns `None`). A2A/AIP action bindings put the verb after a `:` on the
-/// final path segment: v0.3.0 prefixes the resource with `/v1` (`/v1/message:send`); v1.0 drops it
-/// (`/message:send`) and also allows a tenant prefix (`/{tenant}/message:send`). Matching on the final
-/// segment alone therefore recognizes the send across versions and any routing/tenant prefix, while
-/// leaving every non-send REST path (task lifecycle, agent-card discovery) unmatched → ungated.
+/// [`parse_jsonrpc_call`] returns `None`). This is A2A's v1.0 REST surface. A2A/AIP action bindings put
+/// the verb after a `:` on the final path segment (`message:send`), optionally behind an API-version or
+/// tenant prefix (`/v1/message:send`, `/{tenant}/message:send`). Matching on the final segment alone
+/// therefore recognizes the send across any routing prefix, while leaving every non-send REST path
+/// (task lifecycle, agent-card discovery) unmatched → ungated.
 fn a2a_rest_send_path(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
     let last_segment = path.rsplit('/').next().unwrap_or(path);
@@ -393,18 +406,6 @@ fn a2a_rest_send_path(path: &str) -> bool {
         last_segment,
         "message:send" | "message:stream" | "message:sendStream"
     )
-}
-
-/// Resolves the A2A version for the REST binding from the `A2A-Version` header. Per the spec, the
-/// header (value `1.0`) is sent only by v1.0 clients; an absent, empty, or any other value falls back
-/// to v0.3.0. A leading `v` is tolerated.
-fn a2a_version_from_header(value: Option<&str>) -> A2aVersion {
-    match value.map(str::trim) {
-        Some(v) if v.eq_ignore_ascii_case("1.0") || v.eq_ignore_ascii_case("v1.0") => {
-            A2aVersion::V1_0
-        }
-        _ => A2aVersion::V0_3,
-    }
 }
 
 /// The human-readable block message, shared by the MCP and A2A block builders. The wording is
@@ -445,8 +446,9 @@ fn block_headers(disclose: bool, score: Option<f64>) -> Vec<(String, String)> {
 }
 
 /// Dispatches to the protocol-appropriate block builder. The score/threshold decision is made by the
-/// caller ([`request_filter`]); this only shapes the rejection for the wire protocol the request
-/// arrived on.
+/// caller ([`request_filter`]); this only shapes the rejection for the wire protocol/binding the
+/// request arrived on -- MCP and the A2A JSON-RPC binding answer in-band at HTTP 200, the A2A REST
+/// binding with a native HTTP status.
 fn build_block_response(
     protocol: GateProtocol,
     rpc_id: Option<Value>,
@@ -455,7 +457,10 @@ fn build_block_response(
 ) -> Response {
     match protocol {
         GateProtocol::Mcp => block_response(rpc_id, score, config),
-        GateProtocol::A2a(version) => a2a_block_response(version, rpc_id, score, config),
+        GateProtocol::A2a(A2aBinding::JsonRpc(version)) => {
+            a2a_jsonrpc_block_response(version, rpc_id, score, config)
+        }
+        GateProtocol::A2a(A2aBinding::Rest) => a2a_rest_block_response(score, config),
     }
 }
 
@@ -476,15 +481,42 @@ fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) ->
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
-/// Builds the **A2A** rejection when an A2A invocation is blocked. Unlike MCP, the A2A block is HTTP
-/// `403` (Forbidden -- well-formed but denied by policy) carrying a JSON-RPC error with
-/// [`A2A_BLOCK_ERROR_CODE`] (`-32010`, outside A2A's own `-32001..=-32009` range). On **v1.0** the
-/// `error.data` MUST carry a `google.rpc.ErrorInfo` (`@type`/`reason`/`domain`/`metadata`); on
-/// **v0.3.0** `error.data` is free-form and included only when disclosing. `discloseScoreDetails`
-/// gates the `metadata` contents exactly as it gates the MCP message and score header. The same body
-/// is used for both A2A transports (JSON-RPC and the REST send binding); a REST client keys on the
-/// `403` status, and the JSON-RPC-shaped body is harmless, informative extra detail.
-fn a2a_block_response(
+/// Builds the `google.rpc.ErrorInfo` object carried on an A2A v1.0 block -- as the single element of
+/// the JSON-RPC binding's `error.data` array and of the REST binding's `error.details` array. The
+/// stable `reason`/`domain` are always present (they disclose no governance state); the `metadata` map
+/// is populated only when `discloseScoreDetails` is on, exactly as it gates the MCP message and the
+/// score header.
+fn a2a_error_info(disclose: bool, score: Option<f64>, config: &Config) -> Value {
+    let mut metadata = serde_json::Map::new();
+    if disclose {
+        if let Some(score) = score {
+            metadata.insert("score".to_string(), Value::String(format!("{score:.2}")));
+        }
+        metadata.insert(
+            "blockThreshold".to_string(),
+            Value::String(format!("{:.2}", config.block_threshold)),
+        );
+        metadata.insert(
+            "assetId".to_string(),
+            Value::String(config.cdgc_asset_id.clone()),
+        );
+    }
+    serde_json::json!({
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "reason": A2A_ERROR_REASON,
+        "domain": A2A_ERROR_DOMAIN,
+        "metadata": Value::Object(metadata),
+    })
+}
+
+/// Builds the A2A rejection for the **JSON-RPC** binding (Legacy v0.3.0 and V1). Per the A2A/JSON-RPC
+/// transport convention the failure is carried *in-band* at **HTTP 200** -- the transport succeeded,
+/// the error lives in the envelope -- exactly as for MCP; only the code ([`A2A_BLOCK_ERROR_CODE`],
+/// `-32010`) and the `error.data` shape distinguish it. On **v1.0** `error.data` is a single-element
+/// array carrying a `google.rpc.ErrorInfo` (pdk-a2a Shape 2); on **v0.3.0** (Legacy) it is a free-form
+/// string (Shape 1), included only when disclosing. `discloseScoreDetails` gates what the `ErrorInfo`
+/// metadata reveals.
+fn a2a_jsonrpc_block_response(
     version: A2aVersion,
     rpc_id: Option<Value>,
     score: Option<f64>,
@@ -498,32 +530,10 @@ fn a2a_block_response(
     error.insert("message".to_string(), Value::String(message));
 
     let data = match version {
-        A2aVersion::V1_0 => {
-            // v1.0 requires a google.rpc.ErrorInfo. The stable machine-readable reason/domain are
-            // always present (they disclose no governance state); the metadata is gated by disclosure.
-            let mut metadata = serde_json::Map::new();
-            if disclose {
-                if let Some(score) = score {
-                    metadata.insert("score".to_string(), Value::String(format!("{score:.2}")));
-                }
-                metadata.insert(
-                    "blockThreshold".to_string(),
-                    Value::String(format!("{:.2}", config.block_threshold)),
-                );
-                metadata.insert(
-                    "assetId".to_string(),
-                    Value::String(config.cdgc_asset_id.clone()),
-                );
-            }
-            Some(serde_json::json!({
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": A2A_ERROR_REASON,
-                "domain": A2A_ERROR_DOMAIN,
-                "metadata": Value::Object(metadata),
-            }))
-        }
-        // v0.3.0 error.data is free-form; surface the machine-readable reason only when disclosing.
-        A2aVersion::V0_3 if disclose => Some(serde_json::json!({ "reason": A2A_ERROR_REASON })),
+        // v1.0: data is a single-element array carrying a typed google.rpc.ErrorInfo (pdk-a2a Shape 2).
+        A2aVersion::V1_0 => Some(serde_json::json!([a2a_error_info(disclose, score, config)])),
+        // v0.3.0 (Legacy): data is a free-form plain string, surfaced only when disclosing (Shape 1).
+        A2aVersion::V0_3 if disclose => Some(Value::String(A2A_ERROR_REASON.to_string())),
         A2aVersion::V0_3 => None,
     };
     if let Some(data) = data {
@@ -536,7 +546,29 @@ fn a2a_block_response(
         "error": Value::Object(error),
     });
 
-    Response::new(A2A_BLOCK_HTTP_STATUS)
+    // HTTP 200: JSON-RPC carries the failure in-band, not as an HTTP status (pdk-a2a convention).
+    Response::new(200)
+        .with_headers(block_headers(disclose, score))
+        .with_body(serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Builds the A2A rejection for the **HTTP+JSON (REST)** binding (A2A v1.0). This is pdk-a2a Shape 3: a
+/// native HTTP status ([`A2A_REST_BLOCK_HTTP_STATUS`], `403`) with a `google.rpc.Status` body -- **no**
+/// JSON-RPC envelope. `error.code` mirrors the HTTP status and `error.details` is a single-element
+/// array carrying the same `google.rpc.ErrorInfo` as the v1.0 JSON-RPC block.
+fn a2a_rest_block_response(score: Option<f64>, config: &Config) -> Response {
+    let disclose = config.disclose_score_details.unwrap_or(false);
+    let message = block_message(disclose, score, config);
+
+    let body = serde_json::json!({
+        "error": {
+            "code": A2A_REST_BLOCK_HTTP_STATUS,
+            "message": message,
+            "details": [a2a_error_info(disclose, score, config)],
+        }
+    });
+
+    Response::new(A2A_REST_BLOCK_HTTP_STATUS)
         .with_headers(block_headers(disclose, score))
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
@@ -877,8 +909,8 @@ async fn request_filter<S: DataStorage>(
     //      alone classifies both the protocol and (for A2A) the version: the MCP, A2A v0.3.0, and A2A
     //      v1.0 method vocabularies are mutually disjoint (see `classify_jsonrpc_method`).
     //   2. Otherwise, the A2A HTTP+JSON (REST) message-send binding, recognized from the request path
-    //      (its body is a bare SendMessageRequest, not a JSON-RPC envelope). Version comes from the
-    //      `A2A-Version` header, since there is no method string.
+    //      (its body is a bare SendMessageRequest, not a JSON-RPC envelope). This is A2A's v1.0 REST
+    //      surface, answered with a `google.rpc.Status` body (pdk-a2a Shape 3).
     // Anything matching neither passes through ungated (fail-open).
     let (protocol, rpc_id) = match parse_jsonrpc_call(&body) {
         Some((method, rpc_id)) => {
@@ -906,11 +938,10 @@ async fn request_filter<S: DataStorage>(
             // else (a batch array, a non-send REST path, unparsable JSON) passes through ungated.
             let path = state.handler().header(":path").unwrap_or_default();
             if a2a_rest_send_path(&path) {
-                let version =
-                    a2a_version_from_header(state.handler().header(HEADER_A2A_VERSION).as_deref());
-                logger::info!("Gating A2A REST message-send binding (path '{path}')");
-                // The REST send carries no JSON-RPC id; the error object's id is echoed as null.
-                (GateProtocol::A2a(version), None)
+                logger::info!("Gating A2A HTTP+JSON (REST) message-send binding (path '{path}')");
+                // The REST binding answers with a google.rpc.Status body (Shape 3), not a JSON-RPC
+                // envelope, so it carries no rpc id.
+                (GateProtocol::A2a(A2aBinding::Rest), None)
             } else {
                 logger::debug!(
                     "Request is neither a JSON-RPC 2.0 call nor an A2A REST message-send binding; passing through ungated"
@@ -1736,7 +1767,7 @@ mod test {
     // --- A2A (Agent2Agent) gating end-to-end tests ---
 
     #[test]
-    fn a2a_v1_send_below_block_threshold_rejects_403_with_error_info() {
+    fn a2a_v1_send_below_block_threshold_blocks_in_band_200_with_error_info() {
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
@@ -1747,10 +1778,11 @@ mod test {
 
         let response = tester.request(a2a_request(7, "SendMessage"));
 
-        // A2A block differs from MCP's: HTTP 403 (not 200), JSON-RPC -32010 (outside A2A's own
-        // -32001..=-32009 band), and on v1.0 a google.rpc.ErrorInfo carrying the policy-owned
-        // reason/domain.
-        assert_eq!(response.status_code(), 403);
+        // An A2A JSON-RPC block, like MCP, carries the failure in-band at HTTP 200 (the JSON-RPC
+        // transport convention). It differs from MCP only in the code (-32010, above A2A's assigned
+        // -32001..=-32009) and, on v1.0, a single-element google.rpc.ErrorInfo `data` array carrying
+        // the policy-owned reason/domain.
+        assert_eq!(response.status_code(), 200);
         assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
         assert_eq!(response.header("content-type"), Some("application/json"));
         // disclose=false by default: the raw score is not surfaced to the client.
@@ -1759,7 +1791,8 @@ mod test {
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 7);
         assert_eq!(body["error"]["code"], -32010);
-        let info = &body["error"]["data"];
+        // v1.0 error.data is a single-element [ErrorInfo] array, not a bare object.
+        let info = &body["error"]["data"][0];
         assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
         assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
         assert_eq!(info["domain"], "dq-gate.mulesoft.com");
@@ -1772,7 +1805,7 @@ mod test {
     }
 
     #[test]
-    fn a2a_v03_send_below_block_threshold_rejects_403_free_form() {
+    fn a2a_v03_send_below_block_threshold_blocks_in_band_200_free_form() {
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
@@ -1783,9 +1816,11 @@ mod test {
 
         let response = tester.request(a2a_request(11, "message/send"));
 
-        assert_eq!(response.status_code(), 403);
+        // v0.3.0 (Legacy) JSON-RPC block: in-band at HTTP 200, code -32010, free-form error.data.
+        assert_eq!(response.status_code(), 200);
         assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 11);
         assert_eq!(body["error"]["code"], -32010);
         // v0.3 error.data is free-form and OMITTED entirely when discloseScoreDetails=false.
@@ -1844,9 +1879,12 @@ mod test {
     }
 
     #[test]
-    fn a2a_rest_send_binding_below_block_threshold_rejects_403() {
+    fn a2a_rest_send_binding_below_block_threshold_uses_google_rpc_status_403() {
         // The A2A HTTP+JSON (REST) send binding carries a bare SendMessageRequest (no JSON-RPC
-        // envelope), so it is recognized by path, and its version by the A2A-Version header.
+        // envelope), so it is recognized by path. It is A2A's v1.0 REST surface: the rejection is
+        // pdk-a2a Shape 3 -- a NATIVE HTTP 403 with a google.rpc.Status body (error.code == 403,
+        // details[0] a google.rpc.ErrorInfo), NOT a JSON-RPC envelope. The A2A-Version header does not
+        // change this shape (both requests below produce the identical Shape 3).
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
@@ -1855,27 +1893,33 @@ mod test {
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
             .with_entrypoint(super::configure);
 
-        // v0.3 REST send: path prefixed with /v1, no A2A-Version header -> v0.3 free-form (no data).
+        // With an API-version prefix and no A2A-Version header.
         let v03 = tester.request(a2a_rest_send("/v1/message:send", None));
         assert_eq!(v03.status_code(), 403);
         assert_eq!(v03.header("x-dq-gate-status"), Some("blocked"));
         let v03_body: serde_json::Value = serde_json::from_slice(v03.body()).unwrap();
-        assert_eq!(v03_body["error"]["code"], -32010);
-        // A REST send has no JSON-RPC id -> echoed as null.
-        assert_eq!(v03_body["id"], serde_json::Value::Null);
-        assert!(v03_body["error"].get("data").is_none());
+        // Shape 3: no JSON-RPC envelope (no `jsonrpc`, no `id`); error.code mirrors the HTTP status.
+        assert!(v03_body.get("jsonrpc").is_none(), "REST block must not carry a JSON-RPC envelope");
+        assert!(v03_body.get("id").is_none(), "REST block must not carry a JSON-RPC id");
+        assert_eq!(v03_body["error"]["code"], 403);
+        assert_eq!(
+            v03_body["error"]["details"][0]["@type"],
+            "type.googleapis.com/google.rpc.ErrorInfo"
+        );
+        assert_eq!(v03_body["error"]["details"][0]["domain"], "dq-gate.mulesoft.com");
 
-        // v1.0 REST send: no /v1 prefix, A2A-Version: 1.0 header -> v1.0 shape with ErrorInfo. The
-        // cached 50.0 score (TTL 86400s) is reused, so this still blocks without a second CDGC fetch.
+        // Without the prefix and with A2A-Version: 1.0 -> identical Shape 3. The cached 50.0 score
+        // (TTL 86400s) is reused, so this still blocks without a second CDGC fetch.
         let v1 = tester.request(a2a_rest_send("/message:send", Some("1.0")));
         assert_eq!(v1.status_code(), 403);
         let v1_body: serde_json::Value = serde_json::from_slice(v1.body()).unwrap();
-        assert_eq!(v1_body["error"]["code"], -32010);
+        assert!(v1_body.get("jsonrpc").is_none());
+        assert_eq!(v1_body["error"]["code"], 403);
         assert_eq!(
-            v1_body["error"]["data"]["@type"],
+            v1_body["error"]["details"][0]["@type"],
             "type.googleapis.com/google.rpc.ErrorInfo"
         );
-        assert_eq!(v1_body["error"]["data"]["domain"], "dq-gate.mulesoft.com");
+        assert_eq!(v1_body["error"]["details"][0]["domain"], "dq-gate.mulesoft.com");
 
         assert!(backend.next().is_none(), "blocked REST sends must never reach the agent backend");
     }
@@ -2178,23 +2222,24 @@ mod test {
 
     #[test]
     fn classify_jsonrpc_method_partitions_mcp_a2a_and_housekeeping() {
-        use super::{classify_jsonrpc_method, A2aVersion, GateProtocol, RequestClass};
-        // A2A send methods -> gated; the version is inferred from the (version-disjoint) vocabulary.
+        use super::{classify_jsonrpc_method, A2aBinding, A2aVersion, GateProtocol, RequestClass};
+        // A2A JSON-RPC send methods -> gated; the version (which governs the error.data shape) is
+        // inferred from the (version-disjoint) vocabulary, no header needed.
         assert_eq!(
             classify_jsonrpc_method("message/send"),
-            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3))
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V0_3)))
         );
         assert_eq!(
             classify_jsonrpc_method("message/stream"),
-            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3))
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V0_3)))
         );
         assert_eq!(
             classify_jsonrpc_method("SendMessage"),
-            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0))
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V1_0)))
         );
         assert_eq!(
             classify_jsonrpc_method("SendStreamingMessage"),
-            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0))
+            RequestClass::Gated(GateProtocol::A2a(A2aBinding::JsonRpc(A2aVersion::V1_0)))
         );
         // A2A housekeeping (both vocabularies) -> exempt.
         for m in [
@@ -2236,17 +2281,6 @@ mod test {
     }
 
     #[test]
-    fn a2a_version_from_header_defaults_to_v03() {
-        use super::{a2a_version_from_header, A2aVersion};
-        assert_eq!(a2a_version_from_header(Some("1.0")), A2aVersion::V1_0);
-        assert_eq!(a2a_version_from_header(Some("  1.0  ")), A2aVersion::V1_0); // trimmed
-        assert_eq!(a2a_version_from_header(Some("v1.0")), A2aVersion::V1_0);
-        assert_eq!(a2a_version_from_header(None), A2aVersion::V0_3); // absent -> 0.3 per spec
-        assert_eq!(a2a_version_from_header(Some("0.3.0")), A2aVersion::V0_3);
-        assert_eq!(a2a_version_from_header(Some("")), A2aVersion::V0_3);
-    }
-
-    #[test]
     fn a2a_block_error_code_is_outside_a2a_and_mcp_ranges() {
         // The A2A block code must differ from MCP's, and lie outside A2A's own reserved
         // -32001..=-32009 band so it can never collide with an A2A-defined error (e.g. -32008
@@ -2257,20 +2291,29 @@ mod test {
             "A2A block code {} must be outside A2A's reserved -32001..=-32009 band",
             super::A2A_BLOCK_ERROR_CODE
         );
-        assert_eq!(super::A2A_BLOCK_HTTP_STATUS, 403);
+        // The REST/HTTP+JSON send binding maps the block onto a native HTTP status.
+        assert_eq!(super::A2A_REST_BLOCK_HTTP_STATUS, 403);
     }
 
     #[test]
-    fn a2a_block_response_v1_carries_error_info_with_metadata_gated_by_disclosure() {
-        use super::{a2a_block_response, A2aVersion};
+    fn a2a_jsonrpc_block_response_v1_carries_error_info_array_gated_by_disclosure() {
+        use super::{a2a_jsonrpc_block_response, A2aVersion};
+        // The JSON-RPC binding is transport-agnostic of the error: the block rides IN-BAND on
+        // HTTP 200 inside the JSON-RPC envelope (returning a 4xx for a well-formed JSON-RPC call
+        // is a spec mistake). On v1.0 `error.data` MUST be a single-element [ErrorInfo] array.
         // disclose=false: ErrorInfo present (reason/domain always, they leak nothing), metadata empty.
         let cfg = parsed_config(json!({}));
-        let resp = a2a_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
-        assert_eq!(resp.status_code(), 403);
+        let resp = a2a_jsonrpc_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value =
             serde_json::from_slice(resp.body().expect("block response must carry a body")).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
         assert_eq!(body["error"]["code"], -32010);
-        let info = &body["error"]["data"];
+        let data = &body["error"]["data"];
+        assert!(data.is_array(), "v1.0 error.data must be an array: {body}");
+        assert_eq!(data.as_array().unwrap().len(), 1);
+        let info = &data[0];
         assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
         assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
         assert_eq!(info["domain"], "dq-gate.mulesoft.com");
@@ -2278,36 +2321,40 @@ mod test {
 
         // disclose=true: metadata carries the exact score / threshold / asset id.
         let cfg = parsed_config(json!({ "discloseScoreDetails": true }));
-        let resp = a2a_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
+        let resp = a2a_jsonrpc_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value =
             serde_json::from_slice(resp.body().unwrap()).unwrap();
-        let meta = &body["error"]["data"]["metadata"];
+        let meta = &body["error"]["data"][0]["metadata"];
         assert_eq!(meta["score"], "50.00");
         assert_eq!(meta["blockThreshold"], "80.00");
         assert_eq!(meta["assetId"], "asset-1");
     }
 
     #[test]
-    fn a2a_block_response_v03_free_form_data_only_when_disclosing() {
-        use super::{a2a_block_response, A2aVersion};
-        // v0.3 disclose=false: no data at all.
+    fn a2a_jsonrpc_block_response_v03_free_form_data_only_when_disclosing() {
+        use super::{a2a_jsonrpc_block_response, A2aVersion};
+        // v0.3 rides in-band on HTTP 200 too; `error.data` is free-form (v0.3 predates the
+        // structured ErrorInfo binding). disclose=false: no data at all.
         let cfg = parsed_config(json!({}));
-        let resp = a2a_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
-        assert_eq!(resp.status_code(), 403);
+        let resp = a2a_jsonrpc_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value =
             serde_json::from_slice(resp.body().expect("block response must carry a body")).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["error"]["code"], -32010);
         assert!(
             body["error"].get("data").is_none(),
             "v0.3 must omit data when not disclosing: {body}"
         );
 
-        // v0.3 disclose=true: free-form data carrying the machine-readable reason.
+        // v0.3 disclose=true: free-form data is just the machine-readable reason string.
         let cfg = parsed_config(json!({ "discloseScoreDetails": true }));
-        let resp = a2a_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
+        let resp = a2a_jsonrpc_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value =
             serde_json::from_slice(resp.body().unwrap()).unwrap();
-        assert_eq!(body["error"]["data"]["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
+        assert_eq!(body["error"]["data"], "DATA_QUALITY_BELOW_THRESHOLD");
     }
 
     // --- DataStorage error-degradation double (pdk-runtime-model testable-helper pattern) ---
