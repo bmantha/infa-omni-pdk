@@ -27,19 +27,3 @@ services:
     volumes:
       - ./mocks/mock_server.py:/mock_server.py:ro
     command: python /mock_server.py
-  objectstoreauth:
-    image: python:3.12-alpine
-    environment:
-      ROLE: objectstoreauth
-      PORT: "80"
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py
-  objectstore:
-    image: python:3.12-alpine
-    environment:
-      ROLE: objectstore
-      PORT: "80"
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py

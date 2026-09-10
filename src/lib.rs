@@ -860,6 +860,21 @@ mod test {
         }
     }
 
+    /// CDGC Detail mock that serves `score` on the first call, then fails (HTTP 500) on every
+    /// subsequent call. Lets a test populate the cache once and then force the *refresh* to fail
+    /// (exercising the stale-cache fail-open / fail-closed branches of `resolve_score`).
+    fn cdgc_score_once_then_error(score: f64, calls: Rc<RefCell<u32>>) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
+        move |_req: UnitHttpRequest| {
+            let n = { let mut c = calls.borrow_mut(); *c += 1; *c };
+            if n == 1 {
+                UnitHttpResponse::new(200)
+                    .with_body(json!({ "dataQuality": [{ "core.score": score }] }).to_string())
+            } else {
+                UnitHttpResponse::new(500)
+            }
+        }
+    }
+
     #[test]
     fn healthy_score_passes_through_and_tags_the_response() {
         let login_calls = Rc::new(RefCell::new(0));
@@ -897,6 +912,8 @@ mod test {
 
         assert_eq!(response.status_code(), 200);
         assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        // The synthetic block body is JSON-RPC, so it must be served as application/json.
+        assert_eq!(response.header("content-type"), Some("application/json"));
         // Default (discloseScoreDetails=false): no raw score header, generic message, and no
         // score/threshold/asset id leaked to the client.
         assert_eq!(response.header("x-dq-gate-score"), None);
@@ -1111,6 +1128,172 @@ mod test {
         assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
         let violation = response.violation().expect("below-threshold block must emit a PolicyViolation");
         assert_eq!(violation.get_policy_name(), "test_policy_id");
+    }
+
+    #[test]
+    fn aggregate_score_takes_min_by_default_and_averages_when_asked() {
+        // `min` is the conservative default: gate on the worst dimension.
+        let dims = [
+            super::DqDimensionResult { score: 90.0 },
+            super::DqDimensionResult { score: 60.0 },
+            super::DqDimensionResult { score: 75.0 },
+        ];
+        assert_eq!(super::aggregate_score(&dims, "min"), Some(60.0));
+        // Any non-"average" mode string falls back to min.
+        assert_eq!(super::aggregate_score(&dims, "unrecognized"), Some(60.0));
+        // "average" blends the dimensions: (90 + 60 + 75) / 3 = 75.
+        assert_eq!(super::aggregate_score(&dims, "average"), Some(75.0));
+        // No dimensions at all -> no score (drives the unknown-score path upstream).
+        assert_eq!(super::aggregate_score(&[], "min"), None);
+        assert_eq!(super::aggregate_score(&[], "average"), None);
+    }
+
+    #[test]
+    fn score_exactly_at_warn_threshold_is_ok() {
+        // Boundary: warnThreshold=90. `score < warn_threshold` is false at exactly 90, so 90 is OK,
+        // not a warning (the block/warn comparisons are strict `<`).
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(90.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(1));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some());
+    }
+
+    #[test]
+    fn score_exactly_at_block_threshold_warns_not_blocks() {
+        // Boundary: blockThreshold=80. `score < block_threshold` is false at exactly 80, so 80 is
+        // allowed (with a warning, since 80 < warnThreshold 90) rather than blocked.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(80.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(1));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("warn"));
+        assert!(backend.next().is_some(), "a score at the block threshold must still reach the backend");
+    }
+
+    #[test]
+    fn jwt_fetch_sends_session_cookie_ids_header_and_nonce_query() {
+        // Assert the request-shape of the CDGC JWT exchange: the session cookie, the IDS-SESSION-ID
+        // header, and the client_id + per-request nonce query the CDGC identity service expects.
+        let jwt_path = Rc::new(RefCell::new(String::new()));
+        let jwt_cookie = Rc::new(RefCell::new(String::new()));
+        let jwt_ids = Rc::new(RefCell::new(String::new()));
+
+        let (path_c, cookie_c, ids_c) = (Rc::clone(&jwt_path), Rc::clone(&jwt_cookie), Rc::clone(&jwt_ids));
+        let capturing_login = move |req: UnitHttpRequest| {
+            let path = req.header(":path").unwrap_or_default();
+            if path.starts_with("/identity-service/api/v1/Login") {
+                UnitHttpResponse::new(200)
+                    .with_body(json!({ "sessionId": "session-1", "orgId": "org-1" }).to_string())
+            } else if path.starts_with("/identity-service/api/v1/jwt/Token") {
+                *path_c.borrow_mut() = path.to_string();
+                *cookie_c.borrow_mut() = req.header("cookie").unwrap_or_default().to_string();
+                *ids_c.borrow_mut() = req.header("IDS-SESSION-ID").unwrap_or_default().to_string();
+                UnitHttpResponse::new(200).with_body(json!({ "jwt_token": "test-jwt" }).to_string())
+            } else {
+                UnitHttpResponse::new(404)
+            }
+        };
+
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", capturing_login)
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(1));
+        assert_eq!(response.status_code(), 200);
+
+        // Session cookie + IDS header both carry the sessionId returned by Login.
+        assert_eq!(*jwt_cookie.borrow(), "USER_SESSION=session-1");
+        assert_eq!(*jwt_ids.borrow(), "session-1");
+        // The JWT path pins the client_id and carries a nonce query parameter.
+        let path = jwt_path.borrow();
+        assert!(path.contains("client_id=idmc_api"), "jwt path missing client_id: {path}");
+        assert!(path.contains("nonce="), "jwt path missing nonce: {path}");
+    }
+
+    #[test]
+    fn stale_cache_is_served_when_fail_open_true_and_refresh_fails() {
+        // fail-open=true: once a good score is cached, a later CDGC outage on refresh must serve the
+        // last-known-good (stale) score rather than failing the request.
+        let login_calls = Rc::new(RefCell::new(0));
+        let score_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "failOpenOnCdgcError": true })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_once_then_error(95.0, Rc::clone(&score_calls)))
+            .with_entrypoint(super::configure);
+
+        // First request populates the cache with a healthy score.
+        let first = tester.request(mcp_request(1));
+        assert_eq!(first.header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some());
+
+        // Advance past refreshIntervalSeconds (86400) so the cache is stale, and past the refresh
+        // lock TTL (30s) so this request re-attempts the fetch -- which now fails.
+        tester.sleep(Duration::from_secs(86_401));
+
+        let second = tester.request(mcp_request(2));
+        assert_eq!(second.status_code(), 200);
+        assert_eq!(second.header("x-dq-gate-status"), Some("ok"), "stale score must be served on fail-open");
+        assert!(second.body().is_empty(), "a served-stale pass-through must not carry an error body");
+        assert!(backend.next().is_some(), "fail-open must forward the request to the MCP backend");
+        assert!(*score_calls.borrow() >= 2, "the refresh (and its failure) must actually have been attempted");
+    }
+
+    #[test]
+    fn stale_cache_is_treated_as_unknown_when_fail_open_false() {
+        // fail-open=false: a CDGC outage on refresh must NOT serve the stale score. With the score
+        // now unknown and blockOnUnknownScore defaulting closed, the request is blocked -- proving
+        // the healthy stale score (95.0, which would pass) was discarded rather than reused.
+        let login_calls = Rc::new(RefCell::new(0));
+        let score_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "failOpenOnCdgcError": false })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_once_then_error(95.0, Rc::clone(&score_calls)))
+            .with_entrypoint(super::configure);
+
+        // First request caches the healthy score and passes.
+        let first = tester.request(mcp_request(1));
+        assert_eq!(first.header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some());
+
+        tester.sleep(Duration::from_secs(86_401));
+
+        let second = tester.request(mcp_request(2));
+        // Refresh failed + fail-open=false -> unknown -> fail closed (blockOnUnknownScore default true).
+        let body: serde_json::Value = serde_json::from_slice(second.body()).unwrap();
+        assert_eq!(body["error"]["code"], -32008, "fail-open=false must not serve the stale score");
+        assert!(backend.next().is_none(), "a blocked request must never reach the MCP backend");
     }
 
     /// Shared builder for the fail-open recognition tests below: a live-but-low (50.0) CDGC score

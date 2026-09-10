@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal stdlib-only stand-ins for the CDGC (Login/JWT/Detail) and Object Store V2 HTTP
-APIs, for local playground testing (`make run`). Not meant to be realistic -- just enough to
-exercise the policy's Login -> JWT -> dataQuality-fetch and Object Store cache-aside wiring
-end-to-end in Docker.
+"""Minimal stdlib-only stand-ins for the CDGC Login/JWT/Detail HTTP APIs, for local playground
+testing (`make run`). Not meant to be realistic -- just enough to exercise the policy's
+Login -> JWT -> dataQuality-fetch sequence end-to-end in Docker. The DQ score cache and refresh
+lock are handled by PDK-native DataStorage, so no Object Store mock is needed.
 
-Role is picked with the ROLE env var (cdgclogin|cdgcapi|objectstoreauth|objectstore), port
-with PORT (default 80).
+Role is picked with the ROLE env var (cdgclogin|cdgcapi), port with PORT (default 80).
 
 `cdgcapi`'s DQ score starts at DQ_SCORE (default 95) and can be changed live, without a
 restart, via `PUT /score {"score": <value>}` -- e.g. to demo the warn/block behavior:
@@ -24,9 +23,6 @@ PORT = int(os.environ.get("PORT", "80"))
 
 # cdgcapi mock state: current DQ score returned for every asset, mutable via PUT /score.
 current_score = {"value": float(os.environ.get("DQ_SCORE", "95"))}
-
-# Object Store mock state: raw bytes by cache key.
-object_store = {}
 
 
 def read_json(handler):
@@ -93,52 +89,9 @@ class CdgcApiHandler(BaseHTTPRequestHandler):
         pass
 
 
-class ObjectStoreAuthHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        print("[objectstoreauth] issuing token", flush=True)
-        respond(self, 200, {"access_token": "dummy-object-store-token", "expires_in": 3600})
-
-    def log_message(self, fmt, *args):
-        pass
-
-
-class ObjectStoreHandler(BaseHTTPRequestHandler):
-    def _key(self):
-        return self.path.rsplit("/", 1)[-1]
-
-    def do_GET(self):
-        key = self._key()
-        value = object_store.get(key)
-        if value is None:
-            print(f"[objectstore] GET {key!r} -> 404", flush=True)
-            self.send_response(404)
-            self.end_headers()
-            return
-        print(f"[objectstore] GET {key!r} -> hit", flush=True)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(value)))
-        self.end_headers()
-        self.wfile.write(value)
-
-    def do_PUT(self):
-        key = self._key()
-        length = int(self.headers.get("Content-Length", 0))
-        value = self.rfile.read(length) if length else b""
-        object_store[key] = value
-        print(f"[objectstore] PUT {key!r} ({len(value)} bytes)", flush=True)
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, fmt, *args):
-        pass
-
-
 HANDLERS_BY_ROLE = {
     "cdgclogin": CdgcLoginHandler,
     "cdgcapi": CdgcApiHandler,
-    "objectstoreauth": ObjectStoreAuthHandler,
-    "objectstore": ObjectStoreHandler,
 }
 
 if __name__ == "__main__":

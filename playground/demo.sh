@@ -6,8 +6,8 @@
 #   Stack A  (port 8081) — "parks-guests"   — DQ score 95  → requests PASS
 #   Stack B  (port 8082) — "parks-guests-b" — DQ score 65  → requests BLOCKED
 #
-# Both share the same mock images but have independent object stores, so
-# each cache entry is completely separate.
+# Both share the same mock images but run as independent stacks, so each
+# gateway's PDK-native DataStorage cache is completely separate.
 #
 # Usage:
 #   ./playground/demo.sh            # run the full demo
@@ -86,7 +86,7 @@ services:
       - "8081:8081"
     volumes:
       - ./config-demo-a:/usr/local/share/mulesoft/flex-gateway/conf.d/
-    depends_on: [backend-a, cdgclogin-a, cdgcapi-a, osauth-a, os-a]
+    depends_on: [backend-a, cdgclogin-a, cdgcapi-a]
 
   backend-a:
     image: kennethreitz/httpbin
@@ -105,20 +105,6 @@ services:
       - ./mocks/mock_server.py:/mock_server.py:ro
     command: python /mock_server.py
 
-  osauth-a:
-    image: python:3.12-alpine
-    environment: { ROLE: objectstoreauth, PORT: "80" }
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py
-
-  os-a:
-    image: python:3.12-alpine
-    environment: { ROLE: objectstore, PORT: "80" }
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py
-
   # ── Stack B: parks-guests-b (LOW score = BLOCK) ────────────────────────────
   flex-b:
     image: ${FLEX_IMAGE}
@@ -126,7 +112,7 @@ services:
       - "8082:8081"
     volumes:
       - ./config-demo-b:/usr/local/share/mulesoft/flex-gateway/conf.d/
-    depends_on: [backend-b, cdgclogin-b, cdgcapi-b, osauth-b, os-b]
+    depends_on: [backend-b, cdgclogin-b, cdgcapi-b]
 
   backend-b:
     image: kennethreitz/httpbin
@@ -141,20 +127,6 @@ services:
   cdgcapi-b:
     image: python:3.12-alpine
     environment: { ROLE: cdgcapi, PORT: "80", DQ_SCORE: "65" }
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py
-
-  osauth-b:
-    image: python:3.12-alpine
-    environment: { ROLE: objectstoreauth, PORT: "80" }
-    volumes:
-      - ./mocks/mock_server.py:/mock_server.py:ro
-    command: python /mock_server.py
-
-  os-b:
-    image: python:3.12-alpine
-    environment: { ROLE: objectstore, PORT: "80" }
     volumes:
       - ./mocks/mock_server.py:/mock_server.py:ro
     command: python /mock_server.py
@@ -179,9 +151,7 @@ write_stack_config() {
   local asset_id="$2"
   local cdgclogin_host="$3"   # docker service name
   local cdgcapi_host="$4"
-  local osauth_host="$5"
-  local os_host="$6"
-  local backend_host="$7"
+  local backend_host="$5"
 
   mkdir -p "$SCRIPT_DIR/$dir/custom-policies"
 
@@ -223,21 +193,16 @@ spec:
         refreshIntervalSeconds: 30
         failOpenOnCdgcError: true
         blockOnUnknownScore: false
-        objectStoreAuthUrl: http://${osauth_host}/token
-        objectStoreUrl: http://${os_host}
-        objectStoreClientId: dummy-client-id
-        objectStoreClientSecret: dummy-client-secret
-        objectStoreName: dq-gate-demo-store
 YAML
 }
 
 write_stack_config "config-demo-a" \
   "parks-guests-asset" \
-  "cdgclogin-a" "cdgcapi-a" "osauth-a" "os-a" "backend-a"
+  "cdgclogin-a" "cdgcapi-a" "backend-a"
 
 write_stack_config "config-demo-b" \
   "parks-guests-b-asset" \
-  "cdgclogin-b" "cdgcapi-b" "osauth-b" "os-b" "backend-b"
+  "cdgclogin-b" "cdgcapi-b" "backend-b"
 
 success "Stack configs written."
 
@@ -269,7 +234,7 @@ echo ""
 
 RESP_A=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8081/anything/mcp/ \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}')
+  -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
 BODY_A=$(echo "$RESP_A" | head -n -1)
 CODE_A=$(echo "$RESP_A" | tail -n 1)
 
@@ -285,12 +250,12 @@ fi
 
 echo ""
 header "Demo: Stack B — parks-guests-b (DQ score 65, blockThreshold 80)"
-info "Calling Stack B → expect HTTP 400/403 (BLOCKED by DQ gate)"
+info "Calling Stack B → expect a JSON-RPC error -32008 (BLOCKED by DQ gate)"
 echo ""
 
 RESP_B=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8082/anything/mcp/ \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}')
+  -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
 BODY_B=$(echo "$RESP_B" | head -n -1)
 CODE_B=$(echo "$RESP_B" | tail -n 1)
 
@@ -298,10 +263,12 @@ echo "  HTTP $CODE_B"
 echo "  Body: $BODY_B" | head -c 300
 echo ""
 
-if [[ "$CODE_B" == "400" || "$CODE_B" == "403" || "$CODE_B" == "503" ]]; then
-  success "Stack B BLOCKED as expected ✔"
+# The DQ gate blocks at the JSON-RPC layer: it returns HTTP 200 with an error object
+# carrying code -32008 (JSONRPC_BLOCK_ERROR_CODE), NOT an HTTP 4xx. Detect the body.
+if [[ "$BODY_B" == *'-32008'* ]]; then
+  success "Stack B BLOCKED as expected (JSON-RPC -32008) ✔"
 else
-  warn "Stack B returned $CODE_B (check logs — may need cache to populate first)"
+  warn "Stack B did not return a -32008 block (HTTP $CODE_B — cache may need to populate first)"
 fi
 
 # ── live score mutation demo ──────────────────────────────────────────────────
@@ -320,7 +287,7 @@ sleep 31
 info "Retrying Stack B after score update..."
 RESP_B2=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8082/anything/mcp/ \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}')
+  -d '{"jsonrpc":"2.0","method":"tools/call","id":1}')
 CODE_B2=$(echo "$RESP_B2" | tail -n 1)
 BODY_B2=$(echo "$RESP_B2" | head -n -1)
 
@@ -328,18 +295,18 @@ echo "  HTTP $CODE_B2"
 echo "  Body: $BODY_B2" | head -c 300
 echo ""
 
-if [[ "$CODE_B2" == "200" ]]; then
+if [[ "$CODE_B2" == "200" && "$BODY_B2" != *'-32008'* ]]; then
   success "Stack B now PASSES after score update ✔"
 else
-  warn "Stack B returned $CODE_B2 after score update"
+  warn "Stack B still blocked after score update (HTTP $CODE_B2)"
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 header "Summary"
-echo -e "  Stack A (parks-guests,   score=95):  HTTP ${GREEN}${CODE_A}${NC}"
-echo -e "  Stack B (parks-guests-b, score=65):  HTTP ${RED}${CODE_B}${NC}  → blocked by DQ gate"
-echo -e "  Stack B after score→95, TTL flush:   HTTP ${GREEN}${CODE_B2}${NC}"
+echo -e "  Stack A (parks-guests,   score=95):  HTTP ${GREEN}${CODE_A}${NC}  → allowed"
+echo -e "  Stack B (parks-guests-b, score=65):  HTTP ${CODE_B}  → ${RED}blocked${NC} (JSON-RPC -32008)"
+echo -e "  Stack B after score→95, TTL flush:   HTTP ${GREEN}${CODE_B2}${NC}  → allowed"
 echo ""
 info "Stacks are still running. To tear down:"
 echo "  ./playground/demo.sh --cleanup"

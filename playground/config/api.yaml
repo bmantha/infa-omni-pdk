@@ -31,8 +31,3 @@ spec:
         refreshIntervalSeconds: 30
         failOpenOnCdgcError: true
         blockOnUnknownScore: false
-        objectStoreAuthUrl: http://objectstoreauth/token
-        objectStoreUrl: http://objectstore
-        objectStoreClientId: dummy-client-id
-        objectStoreClientSecret: dummy-client-secret
-        objectStoreName: dq-gate-demo-store
