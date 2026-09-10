@@ -62,6 +62,33 @@ const DEFAULT_REFRESH_INTERVAL_SECONDS: i64 = 86_400;
 /// dedicated "blocked by DQ Gate" code, used consistently on both block paths (below-threshold and
 /// unknown-score).
 const JSONRPC_BLOCK_ERROR_CODE: i64 = -32008;
+
+/// JSON-RPC error code returned when an **A2A** invocation is blocked. It MUST differ from the MCP
+/// code above: A2A defines its own errors in the JSON-RPC server-defined reserved range
+/// (`-32000..=-32099`), occupying `-32001..=-32009` (e.g. `-32008` = `ExtensionSupportRequiredError`,
+/// `-32009` = `VersionNotSupportedError`, confirmed against the A2A spec at tags v0.3.0 / v1.0.0). A2A
+/// has no dedicated "blocked by gateway policy" code, and the spec explicitly permits servers to mint
+/// their own codes in that band. `-32010` is the first slot *outside* A2A's assigned range, so it can
+/// never collide with an A2A-defined code -- whereas reusing the MCP `-32008` here would collide with
+/// A2A's `ExtensionSupportRequiredError`.
+const A2A_BLOCK_ERROR_CODE: i64 = -32010;
+/// A2A blocks return HTTP 403 (Forbidden) -- the request is well-formed but denied by policy -- which
+/// both A2A versions list as a valid status. This is deliberately different from the MCP block, which
+/// stays HTTP 200 with the error carried purely in the JSON-RPC envelope (the MCP transport convention).
+const A2A_BLOCK_HTTP_STATUS: u32 = 403;
+/// `google.rpc.ErrorInfo.reason` (UPPER_SNAKE_CASE, no "Error" suffix, per the convention) carried on
+/// an A2A v1.0 block.
+const A2A_ERROR_REASON: &str = "DATA_QUALITY_BELOW_THRESHOLD";
+/// `google.rpc.ErrorInfo.domain` on an A2A v1.0 block. Deliberately NOT `a2a-protocol.org` -- that
+/// domain identifies errors defined *by the A2A protocol itself*; this is a policy-owned domain
+/// identifying the DQ Gate as the service that produced the error.
+const A2A_ERROR_DOMAIN: &str = "dq-gate.mulesoft.com";
+/// Header carrying the A2A protocol version. Present (value `1.0`) only from v1.0 clients; the spec's
+/// fallback rule is that an absent/empty value means v0.3. Used only for the REST binding, where there
+/// is no JSON-RPC `method` string to read the version from (for JSON-RPC the method vocabulary itself
+/// is version-unambiguous -- see [`classify_jsonrpc_method`]).
+const HEADER_A2A_VERSION: &str = "a2a-version";
+
 const HEADER_DQ_SCORE: &str = "x-dq-gate-score";
 const HEADER_DQ_STATUS: &str = "x-dq-gate-status";
 
@@ -88,6 +115,60 @@ const EXEMPT_METHODS: &[&str] = &[
     "ping",
     "logging/setLevel",
     "completion/complete",
+];
+
+// ── A2A (Agent2Agent) method vocabulary ──────────────────────────────────────────────────────────
+//
+// The A2A JSON-RPC surface is the A2A analogue of MCP: the same gating principle applies -- only the
+// *content-bearing* calls that actually invoke the target agent (send a message / task to it) are
+// gated on the DQ score; everything else (task lifecycle, push-notification config, agent-card
+// discovery) is housekeeping and passes through ungated.
+//
+// A2A's two protocol versions use DISJOINT method vocabularies, and both are disjoint from MCP's, so
+// the method string alone classifies both the protocol AND (for A2A) the version -- no header needed
+// for JSON-RPC:
+//   * v0.3.0 uses slash-style names (`message/send`, `tasks/get`, `agent/...`);
+//   * v1.0    uses PascalCase names (`SendMessage`, `GetTask`, ...);
+//   * MCP never uses the `message/`, `tasks/`, or `agent/` prefixes, nor PascalCase.
+// (Confirmed against the A2A spec at tags v0.3.0 and v1.0.0.)
+
+/// A2A v0.3.0 message-send (unary) -- gated.
+const A2A_V03_SEND: &str = "message/send";
+/// A2A v0.3.0 message-send (streaming, SSE) -- gated: it invokes the agent just like the unary send.
+const A2A_V03_STREAM: &str = "message/stream";
+/// A2A v1.0 message-send (unary) -- gated.
+const A2A_V1_SEND: &str = "SendMessage";
+/// A2A v1.0 message-send (streaming) -- gated.
+const A2A_V1_STREAM: &str = "SendStreamingMessage";
+
+/// A2A housekeeping / discovery methods (both versions), enumerated so they are explicitly exempted
+/// rather than falling through to the default MCP-gated arm of [`classify_jsonrpc_method`]. These
+/// manage task state and delivery config or fetch the agent card -- none reads the governed asset's
+/// data, so gating them on a DQ score would be wrong (and would wrongly *block* them below threshold).
+const A2A_HOUSEKEEPING_METHODS: &[&str] = &[
+    // v0.3.0 (slash-style)
+    "tasks/get",
+    "tasks/list",
+    "tasks/cancel",
+    "tasks/resubscribe",
+    "tasks/pushNotificationConfig/set",
+    "tasks/pushNotificationConfig/get",
+    "tasks/pushNotificationConfig/list",
+    "tasks/pushNotificationConfig/delete",
+    "agent/getAuthenticatedExtendedCard",
+    "agent/card",
+    "agent/capabilities",
+    // v1.0 (PascalCase)
+    "GetTask",
+    "ListTasks",
+    "CancelTask",
+    "SubscribeToTask",
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+    "GetExtendedAgentCard",
+    "GetAgentCard",
 ];
 
 /// The cached DQ score for `cdgcAssetId`, and when it was fetched -- compared against
@@ -257,17 +338,82 @@ fn parse_jsonrpc_call(body: &[u8]) -> Option<(String, Option<Value>)> {
     Some((method, id))
 }
 
-/// Builds the JSON-RPC error response returned to the agent when a request is blocked. Status
-/// `200` is intentional: JSON-RPC errors are protocol-level, not transport-level, so an MCP
-/// client expects `200` + an `error` object here, not an HTTP 4xx.
-fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) -> Response {
-    // `discloseScoreDetails` (default false) controls whether internal governance state -- the
-    // exact score, `blockThreshold`, and `cdgcAssetId` -- is revealed to the MCP client. Off by
-    // default so a client can't probe threshold boundaries or learn asset identifiers; the full
-    // detail is always recorded server-side by the `warn!` in `request_filter` regardless (#7).
-    let disclose = config.disclose_score_details.unwrap_or(false);
+/// The A2A protocol version of a gated A2A request. Governs only the *shape* of a block response
+/// (v1.0 must carry a `google.rpc.ErrorInfo`; v0.3.0's `error.data` is free-form) -- the score and
+/// threshold logic is identical for both. For JSON-RPC it is read straight off the (version-disjoint)
+/// method name; for the REST binding, where there is no method string, from the `A2A-Version` header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum A2aVersion {
+    V0_3,
+    V1_0,
+}
 
-    let message = if disclose {
+/// The wire protocol a *gated* request arrived on. Selects the block-response shape: MCP → HTTP 200 +
+/// JSON-RPC `-32008`; A2A → HTTP 403 + JSON-RPC `-32010` (with an `ErrorInfo` on v1.0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GateProtocol {
+    Mcp,
+    A2a(A2aVersion),
+}
+
+/// Classification of a recognized request: gate it on the given protocol's terms, or pass it through
+/// ungated (MCP handshake/discovery, A2A housekeeping, anything unrecognized on a non-send path).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RequestClass {
+    Gated(GateProtocol),
+    Exempt,
+}
+
+/// Classifies a JSON-RPC `method` into gate-or-exempt (and, when gated, which protocol/version shapes
+/// the block). The A2A send methods are matched first (their vocabulary is disjoint from MCP's and
+/// self-describes the version); then A2A housekeeping and the MCP exempt set pass through; anything
+/// else -- the MCP content-bearing methods (`tools/call`, `resources/read`, `prompts/get`) and any
+/// unrecognized method -- is gated as MCP, preserving the MCP-only design's fail-closed default.
+fn classify_jsonrpc_method(method: &str) -> RequestClass {
+    match method {
+        A2A_V03_SEND | A2A_V03_STREAM => RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3)),
+        A2A_V1_SEND | A2A_V1_STREAM => RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0)),
+        _ if A2A_HOUSEKEEPING_METHODS.contains(&method) => RequestClass::Exempt,
+        _ if EXEMPT_METHODS.contains(&method) => RequestClass::Exempt,
+        _ => RequestClass::Gated(GateProtocol::Mcp),
+    }
+}
+
+/// Recognizes the A2A HTTP+JSON (REST) *message-send* binding from the request path, for the transport
+/// where the body is a bare `SendMessageRequest`/`MessageSendParams` (no JSON-RPC envelope, so
+/// [`parse_jsonrpc_call`] returns `None`). A2A/AIP action bindings put the verb after a `:` on the
+/// final path segment: v0.3.0 prefixes the resource with `/v1` (`/v1/message:send`); v1.0 drops it
+/// (`/message:send`) and also allows a tenant prefix (`/{tenant}/message:send`). Matching on the final
+/// segment alone therefore recognizes the send across versions and any routing/tenant prefix, while
+/// leaving every non-send REST path (task lifecycle, agent-card discovery) unmatched → ungated.
+fn a2a_rest_send_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let last_segment = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        last_segment,
+        "message:send" | "message:stream" | "message:sendStream"
+    )
+}
+
+/// Resolves the A2A version for the REST binding from the `A2A-Version` header. Per the spec, the
+/// header (value `1.0`) is sent only by v1.0 clients; an absent, empty, or any other value falls back
+/// to v0.3.0. A leading `v` is tolerated.
+fn a2a_version_from_header(value: Option<&str>) -> A2aVersion {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("1.0") || v.eq_ignore_ascii_case("v1.0") => {
+            A2aVersion::V1_0
+        }
+        _ => A2aVersion::V0_3,
+    }
+}
+
+/// The human-readable block message, shared by the MCP and A2A block builders. The wording is
+/// protocol-neutral. `discloseScoreDetails` (default false) controls whether internal governance
+/// state -- the exact score, `blockThreshold`, and `cdgcAssetId` -- is revealed to the client. Off by
+/// default so a client can't probe threshold boundaries or learn asset identifiers; the full detail
+/// is always recorded server-side by the `warn!` in `request_filter` regardless (#7).
+fn block_message(disclose: bool, score: Option<f64>, config: &Config) -> String {
+    if disclose {
         match score {
             Some(score) => format!(
                 "Blocked by DQ Gate: asset '{}' DQ score {score:.2} is below blockThreshold {:.2}",
@@ -281,24 +427,117 @@ fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) ->
     } else {
         "Blocked by DQ Gate: data quality for the requested source did not meet the required standard"
             .to_string()
-    };
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": rpc_id.unwrap_or(Value::Null),
-        "error": { "code": JSONRPC_BLOCK_ERROR_CODE, "message": message },
-    });
+    }
+}
 
+/// The diagnostic headers shared by every block response, on any protocol: `content-type:
+/// application/json` (the body is always a JSON error object), the raw `x-dq-gate-score` only when
+/// disclosure is opted in, and the always-safe coarse `x-dq-gate-status: blocked`.
+fn block_headers(disclose: bool, score: Option<f64>) -> Vec<(String, String)> {
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     if disclose {
         if let Some(score) = score {
             headers.push((HEADER_DQ_SCORE.to_string(), format!("{score:.2}")));
         }
     }
-    // The coarse status is always safe to surface for downstream annotation.
     headers.push((HEADER_DQ_STATUS.to_string(), "blocked".to_string()));
+    headers
+}
+
+/// Dispatches to the protocol-appropriate block builder. The score/threshold decision is made by the
+/// caller ([`request_filter`]); this only shapes the rejection for the wire protocol the request
+/// arrived on.
+fn build_block_response(
+    protocol: GateProtocol,
+    rpc_id: Option<Value>,
+    score: Option<f64>,
+    config: &Config,
+) -> Response {
+    match protocol {
+        GateProtocol::Mcp => block_response(rpc_id, score, config),
+        GateProtocol::A2a(version) => a2a_block_response(version, rpc_id, score, config),
+    }
+}
+
+/// Builds the **MCP** JSON-RPC error response returned to the agent when a request is blocked. Status
+/// `200` is intentional: MCP treats JSON-RPC errors as protocol-level, not transport-level, so an MCP
+/// client expects `200` + an `error` object carrying [`JSONRPC_BLOCK_ERROR_CODE`], not an HTTP 4xx.
+fn block_response(rpc_id: Option<Value>, score: Option<f64>, config: &Config) -> Response {
+    let disclose = config.disclose_score_details.unwrap_or(false);
+    let message = block_message(disclose, score, config);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.unwrap_or(Value::Null),
+        "error": { "code": JSONRPC_BLOCK_ERROR_CODE, "message": message },
+    });
 
     Response::new(200)
-        .with_headers(headers)
+        .with_headers(block_headers(disclose, score))
+        .with_body(serde_json::to_vec(&body).unwrap_or_default())
+}
+
+/// Builds the **A2A** rejection when an A2A invocation is blocked. Unlike MCP, the A2A block is HTTP
+/// `403` (Forbidden -- well-formed but denied by policy) carrying a JSON-RPC error with
+/// [`A2A_BLOCK_ERROR_CODE`] (`-32010`, outside A2A's own `-32001..=-32009` range). On **v1.0** the
+/// `error.data` MUST carry a `google.rpc.ErrorInfo` (`@type`/`reason`/`domain`/`metadata`); on
+/// **v0.3.0** `error.data` is free-form and included only when disclosing. `discloseScoreDetails`
+/// gates the `metadata` contents exactly as it gates the MCP message and score header. The same body
+/// is used for both A2A transports (JSON-RPC and the REST send binding); a REST client keys on the
+/// `403` status, and the JSON-RPC-shaped body is harmless, informative extra detail.
+fn a2a_block_response(
+    version: A2aVersion,
+    rpc_id: Option<Value>,
+    score: Option<f64>,
+    config: &Config,
+) -> Response {
+    let disclose = config.disclose_score_details.unwrap_or(false);
+    let message = block_message(disclose, score, config);
+
+    let mut error = serde_json::Map::new();
+    error.insert("code".to_string(), serde_json::json!(A2A_BLOCK_ERROR_CODE));
+    error.insert("message".to_string(), Value::String(message));
+
+    let data = match version {
+        A2aVersion::V1_0 => {
+            // v1.0 requires a google.rpc.ErrorInfo. The stable machine-readable reason/domain are
+            // always present (they disclose no governance state); the metadata is gated by disclosure.
+            let mut metadata = serde_json::Map::new();
+            if disclose {
+                if let Some(score) = score {
+                    metadata.insert("score".to_string(), Value::String(format!("{score:.2}")));
+                }
+                metadata.insert(
+                    "blockThreshold".to_string(),
+                    Value::String(format!("{:.2}", config.block_threshold)),
+                );
+                metadata.insert(
+                    "assetId".to_string(),
+                    Value::String(config.cdgc_asset_id.clone()),
+                );
+            }
+            Some(serde_json::json!({
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "reason": A2A_ERROR_REASON,
+                "domain": A2A_ERROR_DOMAIN,
+                "metadata": Value::Object(metadata),
+            }))
+        }
+        // v0.3.0 error.data is free-form; surface the machine-readable reason only when disclosing.
+        A2aVersion::V0_3 if disclose => Some(serde_json::json!({ "reason": A2A_ERROR_REASON })),
+        A2aVersion::V0_3 => None,
+    };
+    if let Some(data) = data {
+        error.insert("data".to_string(), data);
+    }
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.unwrap_or(Value::Null),
+        "error": Value::Object(error),
+    });
+
+    Response::new(A2A_BLOCK_HTTP_STATUS)
+        .with_headers(block_headers(disclose, score))
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
@@ -608,11 +847,13 @@ async fn request_filter<S: DataStorage>(
     // with this combined state does not apply here -- this is the request leg.
     let state = request_state.into_headers_body_state().await;
 
-    // Fail-open recognition (pdk-mcp contract): only gate genuine MCP tool-invocation traffic.
-    // Anything that is not a POST of a JSON-RPC 2.0 object -- a GET opening a Streamable-HTTP SSE
-    // session, a health probe, a non-JSON content type, unparsable JSON, or a batch array --
-    // passes straight through ungated, so the policy never breaks non-MCP traffic or connection
-    // establishment. This is the opposite of failing closed on anything it does not understand.
+    // Fail-open recognition (pdk-mcp / A2A contract): only gate genuine *invocation* traffic on the
+    // two protocols this policy governs -- MCP and A2A (Agent2Agent). Anything that is not a POST of
+    // application/json -- a GET opening a Streamable-HTTP SSE session, a health probe, a non-JSON
+    // content type (including the A2A gRPC transport, which is application/grpc and thus documented
+    // pass-through), unparsable JSON, or a batch array -- passes straight through ungated, so the
+    // policy never breaks non-MCP/A2A traffic or connection establishment. This is the opposite of
+    // failing closed on anything it does not understand.
     let request_method = state.handler().header(":method").unwrap_or_default();
     if !request_method.eq_ignore_ascii_case("POST") {
         logger::debug!("Non-POST request ('{request_method}'); passing through ungated");
@@ -630,28 +871,54 @@ async fn request_filter<S: DataStorage>(
         Vec::new()
     };
 
-    let Some((method, rpc_id)) = parse_jsonrpc_call(&body) else {
-        logger::debug!(
-            "Request body is not a single JSON-RPC 2.0 call (unparsable, batch array, or missing method); passing through ungated"
-        );
-        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    // Classify the request into (gated protocol, JSON-RPC id) or pass it through. Two recognition
+    // paths feed the same score gate:
+    //   1. A JSON-RPC 2.0 envelope -- shared by MCP and the A2A JSON-RPC transport. The method name
+    //      alone classifies both the protocol and (for A2A) the version: the MCP, A2A v0.3.0, and A2A
+    //      v1.0 method vocabularies are mutually disjoint (see `classify_jsonrpc_method`).
+    //   2. Otherwise, the A2A HTTP+JSON (REST) message-send binding, recognized from the request path
+    //      (its body is a bare SendMessageRequest, not a JSON-RPC envelope). Version comes from the
+    //      `A2A-Version` header, since there is no method string.
+    // Anything matching neither passes through ungated (fail-open).
+    let (protocol, rpc_id) = match parse_jsonrpc_call(&body) {
+        Some((method, rpc_id)) => {
+            // A notification (a `notifications/*` method, or any call without an `id`) may NEVER
+            // receive a response per JSON-RPC 2.0, so it can't be answered with a block -- pass it on.
+            if is_notification_method(&method) || rpc_id.is_none() {
+                logger::debug!(
+                    "Notification-style request '{method}' (no response permitted); passing through ungated"
+                );
+                return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+            }
+            match classify_jsonrpc_method(&method) {
+                // MCP handshake/discovery and A2A task/config/discovery housekeeping touch no asset
+                // data and are exempt; only the content-bearing invocations (MCP tools/call,
+                // resources/read, prompts/get; A2A message-send/stream) are gated on the DQ score.
+                RequestClass::Exempt => {
+                    logger::info!("Method '{method}' is exempt from DQ gating, passing through");
+                    return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+                }
+                RequestClass::Gated(protocol) => (protocol, rpc_id),
+            }
+        }
+        None => {
+            // Not a JSON-RPC envelope. Recognize the A2A REST message-send binding by path; anything
+            // else (a batch array, a non-send REST path, unparsable JSON) passes through ungated.
+            let path = state.handler().header(":path").unwrap_or_default();
+            if a2a_rest_send_path(&path) {
+                let version =
+                    a2a_version_from_header(state.handler().header(HEADER_A2A_VERSION).as_deref());
+                logger::info!("Gating A2A REST message-send binding (path '{path}')");
+                // The REST send carries no JSON-RPC id; the error object's id is echoed as null.
+                (GateProtocol::A2a(version), None)
+            } else {
+                logger::debug!(
+                    "Request is neither a JSON-RPC 2.0 call nor an A2A REST message-send binding; passing through ungated"
+                );
+                return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+            }
+        }
     };
-
-    // A notification (a `notifications/*` method, or any call without an `id`) may NEVER receive a
-    // response per JSON-RPC 2.0, so it can't be answered with a block error -- pass it through.
-    if is_notification_method(&method) || rpc_id.is_none() {
-        logger::debug!(
-            "Notification-style request '{method}' (no response permitted); passing through ungated"
-        );
-        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
-    }
-
-    // Handshake/discovery/administrative methods touch no asset data and are exempt; only the
-    // content-bearing set (tools/call, resources/read, prompts/get) is gated on the DQ score.
-    if EXEMPT_METHODS.contains(&method.as_str()) {
-        logger::info!("Method '{method}' is exempt from DQ gating, passing through");
-        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
-    }
 
     let score = resolve_score(client, config, score_store, lock_store, clock).await;
 
@@ -675,7 +942,7 @@ async fn request_filter<S: DataStorage>(
                 // carries the policy name/type (the API exposes no custom fields), so the asset id
                 // and threshold live in the correlated warn log above.
                 violations.generate_policy_violation();
-                Flow::Break(block_response(rpc_id, None, config))
+                Flow::Break(build_block_response(protocol, rpc_id, None, config))
             } else {
                 // Soft-launch bypass: passing traffic UNGATED. Warn ONCE per worker so the window
                 // during which the control is disabled is observable without flooding the logs.
@@ -701,7 +968,7 @@ async fn request_filter<S: DataStorage>(
             );
             // Denial telemetry (see note above): score/threshold/asset id are in the warn log.
             violations.generate_policy_violation();
-            Flow::Break(block_response(rpc_id, Some(score), config))
+            Flow::Break(build_block_response(protocol, rpc_id, Some(score), config))
         }
         Some(score) if score < config.warn_threshold => {
             logger::warn!(
@@ -833,6 +1100,30 @@ mod test {
             .with_path("/mcp")
             .with_header("content-type", "application/json")
             .with_body(json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string())
+    }
+
+    /// An A2A JSON-RPC request for `method` (e.g. "message/send" for v0.3, "SendMessage" for v1.0),
+    /// mirroring `mcp_request_with_method`. The A2A JSON-RPC transport shares MCP's envelope; only the
+    /// method vocabulary differs.
+    fn a2a_request(id: i64, method: &str) -> UnitHttpRequest {
+        UnitHttpRequest::post()
+            .with_path("/a2a")
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "jsonrpc": "2.0", "id": id, "method": method }).to_string())
+    }
+
+    /// An A2A HTTP+JSON (REST) message-send request: a bare `SendMessageRequest` body (NOT a JSON-RPC
+    /// envelope) at the versioned action `path`. `version_header`, when `Some`, sets `A2A-Version`
+    /// (only v1.0 clients send it), which is how the REST branch resolves the protocol version.
+    fn a2a_rest_send(path: &str, version_header: Option<&str>) -> UnitHttpRequest {
+        let mut req = UnitHttpRequest::post()
+            .with_path(path)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "message": { "role": "user", "parts": [] } }).to_string());
+        if let Some(version) = version_header {
+            req = req.with_header("a2a-version", version);
+        }
+        req
     }
 
     /// Stateful CDGC login mock: always succeeds, tracking call count so tests can assert
@@ -1442,6 +1733,153 @@ mod test {
         assert_eq!(*login_calls.borrow(), 0);
     }
 
+    // --- A2A (Agent2Agent) gating end-to-end tests ---
+
+    #[test]
+    fn a2a_v1_send_below_block_threshold_rejects_403_with_error_info() {
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(a2a_request(7, "SendMessage"));
+
+        // A2A block differs from MCP's: HTTP 403 (not 200), JSON-RPC -32010 (outside A2A's own
+        // -32001..=-32009 band), and on v1.0 a google.rpc.ErrorInfo carrying the policy-owned
+        // reason/domain.
+        assert_eq!(response.status_code(), 403);
+        assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        assert_eq!(response.header("content-type"), Some("application/json"));
+        // disclose=false by default: the raw score is not surfaced to the client.
+        assert_eq!(response.header("x-dq-gate-score"), None);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["error"]["code"], -32010);
+        let info = &body["error"]["data"];
+        assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+        assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
+        assert_eq!(info["domain"], "dq-gate.mulesoft.com");
+        // disclose=false: metadata must not leak score/threshold/asset id.
+        assert!(
+            info["metadata"].as_object().unwrap().is_empty(),
+            "metadata must be empty when not disclosing: {info}"
+        );
+        assert!(backend.next().is_none(), "a blocked A2A send must never reach the agent backend");
+    }
+
+    #[test]
+    fn a2a_v03_send_below_block_threshold_rejects_403_free_form() {
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(a2a_request(11, "message/send"));
+
+        assert_eq!(response.status_code(), 403);
+        assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["id"], 11);
+        assert_eq!(body["error"]["code"], -32010);
+        // v0.3 error.data is free-form and OMITTED entirely when discloseScoreDetails=false.
+        assert!(
+            body["error"].get("data").is_none(),
+            "v0.3 must omit data when not disclosing: {body}"
+        );
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("did not meet the required standard"), "got: {msg}");
+        assert!(!msg.contains("asset-1"), "must not leak asset id: {msg}");
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn a2a_send_healthy_score_passes_through_and_tags_response() {
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(a2a_request(1, "SendMessage"));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some(), "a healthy A2A send must reach the agent backend");
+    }
+
+    #[test]
+    fn a2a_housekeeping_methods_pass_through_ungated() {
+        // A2A task/config/discovery housekeeping (both vocabularies) touches no asset data, so it
+        // must be exempt even below block threshold, and `resolve_score` must never run -- proven by
+        // `login_calls == 0` (the recognition_tester registers a low 50.0 score that WOULD block if
+        // the method were ever gated).
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        for method in [
+            "tasks/get",
+            "tasks/pushNotificationConfig/get",
+            "agent/getAuthenticatedExtendedCard",
+            "GetTask",
+            "GetExtendedAgentCard",
+            "CancelTask",
+        ] {
+            let response = tester.request(a2a_request(5, method));
+            assert_eq!(response.status_code(), 200, "{method} must pass through");
+            assert_eq!(response.header("x-dq-gate-status"), Some("skipped"), "{method}");
+            assert!(response.body().is_empty(), "{method} must not receive an error body");
+            assert!(backend.next().is_some(), "{method} must reach the backend");
+        }
+        assert_eq!(*login_calls.borrow(), 0, "A2A housekeeping must not trigger a CDGC fetch");
+    }
+
+    #[test]
+    fn a2a_rest_send_binding_below_block_threshold_rejects_403() {
+        // The A2A HTTP+JSON (REST) send binding carries a bare SendMessageRequest (no JSON-RPC
+        // envelope), so it is recognized by path, and its version by the A2A-Version header.
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(50.0))
+            .with_entrypoint(super::configure);
+
+        // v0.3 REST send: path prefixed with /v1, no A2A-Version header -> v0.3 free-form (no data).
+        let v03 = tester.request(a2a_rest_send("/v1/message:send", None));
+        assert_eq!(v03.status_code(), 403);
+        assert_eq!(v03.header("x-dq-gate-status"), Some("blocked"));
+        let v03_body: serde_json::Value = serde_json::from_slice(v03.body()).unwrap();
+        assert_eq!(v03_body["error"]["code"], -32010);
+        // A REST send has no JSON-RPC id -> echoed as null.
+        assert_eq!(v03_body["id"], serde_json::Value::Null);
+        assert!(v03_body["error"].get("data").is_none());
+
+        // v1.0 REST send: no /v1 prefix, A2A-Version: 1.0 header -> v1.0 shape with ErrorInfo. The
+        // cached 50.0 score (TTL 86400s) is reused, so this still blocks without a second CDGC fetch.
+        let v1 = tester.request(a2a_rest_send("/message:send", Some("1.0")));
+        assert_eq!(v1.status_code(), 403);
+        let v1_body: serde_json::Value = serde_json::from_slice(v1.body()).unwrap();
+        assert_eq!(v1_body["error"]["code"], -32010);
+        assert_eq!(
+            v1_body["error"]["data"]["@type"],
+            "type.googleapis.com/google.rpc.ErrorInfo"
+        );
+        assert_eq!(v1_body["error"]["data"]["domain"], "dq-gate.mulesoft.com");
+
+        assert!(backend.next().is_none(), "blocked REST sends must never reach the agent backend");
+    }
+
     // --- DataStorage-native helper tests (pdk-runtime-model testable-helper pattern) ---
 
     /// Minimal in-memory [`DataStorage`] test double with version tracking, so `StoreMode::Absent`
@@ -1734,6 +2172,142 @@ mod test {
             body["error"]["message"].as_str().unwrap(),
             "Blocked by DQ Gate: no DQ score is available yet for asset 'asset-1'"
         );
+    }
+
+    // --- A2A pure-function coverage (classify / rest-path / version / block shape) ---
+
+    #[test]
+    fn classify_jsonrpc_method_partitions_mcp_a2a_and_housekeeping() {
+        use super::{classify_jsonrpc_method, A2aVersion, GateProtocol, RequestClass};
+        // A2A send methods -> gated; the version is inferred from the (version-disjoint) vocabulary.
+        assert_eq!(
+            classify_jsonrpc_method("message/send"),
+            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3))
+        );
+        assert_eq!(
+            classify_jsonrpc_method("message/stream"),
+            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V0_3))
+        );
+        assert_eq!(
+            classify_jsonrpc_method("SendMessage"),
+            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0))
+        );
+        assert_eq!(
+            classify_jsonrpc_method("SendStreamingMessage"),
+            RequestClass::Gated(GateProtocol::A2a(A2aVersion::V1_0))
+        );
+        // A2A housekeeping (both vocabularies) -> exempt.
+        for m in [
+            "tasks/get",
+            "tasks/pushNotificationConfig/set",
+            "agent/getAuthenticatedExtendedCard",
+            "GetTask",
+            "GetExtendedAgentCard",
+            "CancelTask",
+        ] {
+            assert_eq!(classify_jsonrpc_method(m), RequestClass::Exempt, "{m}");
+        }
+        // MCP handshake/discovery -> exempt.
+        for m in ["initialize", "tools/list", "ping"] {
+            assert_eq!(classify_jsonrpc_method(m), RequestClass::Exempt, "{m}");
+        }
+        // MCP content-bearing methods AND any unrecognized method -> gated as MCP (fail-closed
+        // default preserved from the MCP-only design).
+        for m in ["tools/call", "resources/read", "prompts/get", "some/unknown"] {
+            assert_eq!(classify_jsonrpc_method(m), RequestClass::Gated(GateProtocol::Mcp), "{m}");
+        }
+    }
+
+    #[test]
+    fn a2a_rest_send_path_matches_only_send_bindings() {
+        use super::a2a_rest_send_path;
+        // Send bindings across versions, tenant/routing prefixes, and query strings.
+        assert!(a2a_rest_send_path("/v1/message:send")); // v0.3
+        assert!(a2a_rest_send_path("/message:send")); // v1.0
+        assert!(a2a_rest_send_path("/acme/message:send")); // tenant-scoped v1.0
+        assert!(a2a_rest_send_path("/v1/message:stream"));
+        assert!(a2a_rest_send_path("/message:sendStream"));
+        assert!(a2a_rest_send_path("/message:send?foo=bar")); // query stripped
+        // Non-send REST paths (housekeeping/discovery) must NOT be gated.
+        assert!(!a2a_rest_send_path("/v1/tasks/abc"));
+        assert!(!a2a_rest_send_path("/tasks/abc:cancel"));
+        assert!(!a2a_rest_send_path("/.well-known/agent-card.json"));
+        assert!(!a2a_rest_send_path("/message"));
+    }
+
+    #[test]
+    fn a2a_version_from_header_defaults_to_v03() {
+        use super::{a2a_version_from_header, A2aVersion};
+        assert_eq!(a2a_version_from_header(Some("1.0")), A2aVersion::V1_0);
+        assert_eq!(a2a_version_from_header(Some("  1.0  ")), A2aVersion::V1_0); // trimmed
+        assert_eq!(a2a_version_from_header(Some("v1.0")), A2aVersion::V1_0);
+        assert_eq!(a2a_version_from_header(None), A2aVersion::V0_3); // absent -> 0.3 per spec
+        assert_eq!(a2a_version_from_header(Some("0.3.0")), A2aVersion::V0_3);
+        assert_eq!(a2a_version_from_header(Some("")), A2aVersion::V0_3);
+    }
+
+    #[test]
+    fn a2a_block_error_code_is_outside_a2a_and_mcp_ranges() {
+        // The A2A block code must differ from MCP's, and lie outside A2A's own reserved
+        // -32001..=-32009 band so it can never collide with an A2A-defined error (e.g. -32008
+        // ExtensionSupportRequiredError).
+        assert_ne!(super::A2A_BLOCK_ERROR_CODE, super::JSONRPC_BLOCK_ERROR_CODE);
+        assert!(
+            !(-32009..=-32001).contains(&super::A2A_BLOCK_ERROR_CODE),
+            "A2A block code {} must be outside A2A's reserved -32001..=-32009 band",
+            super::A2A_BLOCK_ERROR_CODE
+        );
+        assert_eq!(super::A2A_BLOCK_HTTP_STATUS, 403);
+    }
+
+    #[test]
+    fn a2a_block_response_v1_carries_error_info_with_metadata_gated_by_disclosure() {
+        use super::{a2a_block_response, A2aVersion};
+        // disclose=false: ErrorInfo present (reason/domain always, they leak nothing), metadata empty.
+        let cfg = parsed_config(json!({}));
+        let resp = a2a_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 403);
+        let body: serde_json::Value =
+            serde_json::from_slice(resp.body().expect("block response must carry a body")).unwrap();
+        assert_eq!(body["error"]["code"], -32010);
+        let info = &body["error"]["data"];
+        assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+        assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
+        assert_eq!(info["domain"], "dq-gate.mulesoft.com");
+        assert!(info["metadata"].as_object().unwrap().is_empty());
+
+        // disclose=true: metadata carries the exact score / threshold / asset id.
+        let cfg = parsed_config(json!({ "discloseScoreDetails": true }));
+        let resp = a2a_block_response(A2aVersion::V1_0, Some(json!(7)), Some(50.0), &cfg);
+        let body: serde_json::Value =
+            serde_json::from_slice(resp.body().unwrap()).unwrap();
+        let meta = &body["error"]["data"]["metadata"];
+        assert_eq!(meta["score"], "50.00");
+        assert_eq!(meta["blockThreshold"], "80.00");
+        assert_eq!(meta["assetId"], "asset-1");
+    }
+
+    #[test]
+    fn a2a_block_response_v03_free_form_data_only_when_disclosing() {
+        use super::{a2a_block_response, A2aVersion};
+        // v0.3 disclose=false: no data at all.
+        let cfg = parsed_config(json!({}));
+        let resp = a2a_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
+        assert_eq!(resp.status_code(), 403);
+        let body: serde_json::Value =
+            serde_json::from_slice(resp.body().expect("block response must carry a body")).unwrap();
+        assert_eq!(body["error"]["code"], -32010);
+        assert!(
+            body["error"].get("data").is_none(),
+            "v0.3 must omit data when not disclosing: {body}"
+        );
+
+        // v0.3 disclose=true: free-form data carrying the machine-readable reason.
+        let cfg = parsed_config(json!({ "discloseScoreDetails": true }));
+        let resp = a2a_block_response(A2aVersion::V0_3, Some(json!(1)), Some(50.0), &cfg);
+        let body: serde_json::Value =
+            serde_json::from_slice(resp.body().unwrap()).unwrap();
+        assert_eq!(body["error"]["data"]["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
     }
 
     // --- DataStorage error-degradation double (pdk-runtime-model testable-helper pattern) ---

@@ -1,23 +1,55 @@
 # IDMC Data Quality Gate
 
-A MuleSoft Flex/Omni Gateway custom policy that gates inbound MCP tool-invocation traffic on the
-current **data-quality (DQ) score** of a CDGC-governed asset in Informatica IDMC. It is written in
-Rust with the [Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview)
-and compiled to WebAssembly (`wasm32-wasip1`).
+A MuleSoft Flex/Omni Gateway custom policy that gates inbound **MCP** tool-invocation traffic **and
+A2A (Agent2Agent) message-send** traffic on the current **data-quality (DQ) score** of a CDGC-governed
+asset in Informatica IDMC. It is written in Rust with the
+[Policy Development Kit (PDK)](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview) and compiled
+to WebAssembly (`wasm32-wasip1`).
 
 ## What it does
 
-For each gated MCP JSON-RPC call (`tools/call`, `resources/read`, `prompts/get`), the policy compares
-the monitored asset's DQ score against two configurable thresholds and acts before the request
-reaches the upstream MCP server:
+The policy compares the monitored asset's DQ score against two configurable thresholds and acts
+**before the request reaches the upstream MCP server or A2A agent**. Only the content-bearing
+invocations are gated:
 
-| Score vs. thresholds | Outcome |
-|---|---|
-| ≥ `warnThreshold` | Allowed (`x-dq-gate-status: ok`) |
-| ≥ `blockThreshold`, `< warnThreshold` | Allowed with a warning (`x-dq-gate-status: warn`) |
-| `< blockThreshold` | Rejected with a JSON-RPC error (`-32008`); a PolicyViolation is reported |
+- **MCP** JSON-RPC calls — `tools/call`, `resources/read`, `prompts/get`.
+- **A2A** message-send invocations — across **both A2A v0.3.0 and v1.0** and both transports:
+  - the JSON-RPC send methods: `message/send` / `message/stream` (v0.3.0) and
+    `SendMessage` / `SendStreamingMessage` (v1.0);
+  - the A2A HTTP+JSON (REST) send binding (a path ending in `message:send`), with the protocol version
+    taken from the `A2A-Version` request header.
 
-Defaults are `warnThreshold: 90` / `blockThreshold: 80`.
+The score decision is identical for both protocols; only the **rejection shape** differs so each
+client sees a protocol-conformant error (see below):
+
+| Score vs. thresholds | MCP outcome | A2A outcome |
+|---|---|---|
+| ≥ `warnThreshold` | Allowed (`x-dq-gate-status: ok`) | Allowed (`x-dq-gate-status: ok`) |
+| ≥ `blockThreshold`, `< warnThreshold` | Allowed with a warning (`x-dq-gate-status: warn`) | Allowed with a warning (`x-dq-gate-status: warn`) |
+| `< blockThreshold` | HTTP 200 + JSON-RPC error `-32008` | HTTP 403 + JSON-RPC error `-32010` |
+
+A PolicyViolation is reported on every block. Defaults are `warnThreshold: 90` / `blockThreshold: 80`.
+
+### Protocol-conformant A2A rejections
+
+MCP treats a JSON-RPC error as protocol-level, so an MCP block is **HTTP 200** carrying error `-32008`.
+An A2A rejection is instead a transport-level **HTTP 403** carrying JSON-RPC error code **`-32010`** —
+chosen to sit *outside* A2A's own reserved band (`-32001..=-32009`, which already assigns `-32008` to
+`ExtensionSupportRequiredError` and `-32009` to `VersionNotSupportedError` in v1.0), so it never
+collides with a real A2A error. On **A2A v1.0** the `error.data` carries a
+[`google.rpc.ErrorInfo`](https://cloud.google.com/apis/design/errors) (`reason:
+DATA_QUALITY_BELOW_THRESHOLD`, `domain: dq-gate.mulesoft.com`); on **v0.3.0** `error.data` is free-form
+(populated only when `discloseScoreDetails` is on). The same body is returned for both A2A transports —
+a REST send-binding client keys on the `403`, and the JSON-RPC-shaped body is harmless extra detail.
+
+A2A **housekeeping** methods — task management, push-notification config, and agent-card discovery
+(`tasks/*`, `agent/*` in v0.3.0; `GetTask`, `ListTasks`, `*PushNotificationConfig*`, `GetAgentCard`, …
+in v1.0) — touch no asset data and pass through **ungated**, exactly like MCP's handshake/discovery
+methods.
+
+> **gRPC transport:** A2A's optional gRPC binding is a documented pass-through — its
+> `application/grpc` content type is not `application/json`, so the recognition step skips it ungated.
+> Gate A2A agents on their JSON-RPC or REST HTTP surface.
 
 ### CDGC / IDMC integration
 
@@ -36,9 +68,10 @@ replicas via gossip-replicated storage; the default keeps per-replica in-memory 
 
 ### Safety posture
 
-- **Fail-open recognition:** only genuine MCP JSON-RPC calls are gated. Non-POST requests, non-JSON
-  bodies, handshake/discovery methods, notifications, and JSON-RPC batches pass through ungated, so the
-  policy never breaks non-MCP traffic or connection setup.
+- **Fail-open recognition:** only genuine MCP tool calls and A2A message-send invocations are gated.
+  Non-POST requests, non-JSON bodies, MCP handshake/discovery methods, A2A housekeeping methods,
+  notifications, JSON-RPC batches, and unrecognized paths pass through ungated, so the policy never
+  breaks non-gated traffic or connection setup.
 - **Fail-closed on the unknown:** when no score is available at all (cold start, or a CDGC outage with
   an empty cache), the gate blocks by default (`blockOnUnknownScore: true`). A deliberate soft launch can
   set it `false`; the bypass window is logged once per worker.

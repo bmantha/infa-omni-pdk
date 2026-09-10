@@ -85,6 +85,47 @@ Always tell the user *which* property or connector was blocked and that the DQ G
 
 `playground/demo.sh` exists for a self-contained Docker-based demo (two isolated Flex stacks, same contrast), but for a quick Claude Desktop demo the MCP connectors above are sufficient.
 
+## Protocol support: MCP and A2A
+
+The gate is **protocol-aware but score-agnostic**: the DQ-score decision (allow / warn / block) is one
+piece of logic; how a request is *recognized* and how a *rejection is shaped* branch by protocol. Two
+recognition paths feed the same score gate (both only after the POST + `application/json` guards):
+
+1. **JSON-RPC 2.0 envelope** — shared by MCP and the A2A JSON-RPC transport. The **method name alone**
+   classifies both the protocol and, for A2A, the version, because the three method vocabularies are
+   mutually disjoint (`classify_jsonrpc_method`):
+   - **MCP gated:** `tools/call`, `resources/read`, `prompts/get`.
+   - **A2A v0.3.0 gated:** `message/send`, `message/stream`.
+   - **A2A v1.0 gated:** `SendMessage`, `SendStreamingMessage`.
+   - **Exempt (pass-through, no score fetch):** MCP handshake/discovery (`initialize`, `tools/list`, …)
+     and A2A housekeeping — v0.3.0 `tasks/*`, `agent/*`; v1.0 `GetTask`, `ListTasks`, `CancelTask`,
+     `*PushNotificationConfig*`, `GetAgentCard`/`GetExtendedAgentCard`, …
+2. **A2A HTTP+JSON (REST) send binding** — recognized by request **path** (final segment
+   `message:send` / `message:stream`), since the body is a bare `SendMessageRequest`, not a JSON-RPC
+   envelope. The version comes from the **`A2A-Version` header** (`1.0` → v1.0; absent → v0.3.0), the
+   only place a header is consulted for version — the JSON-RPC path never needs it.
+
+Anything matching neither path (a batch array, a non-send REST path, a notification, unparsable JSON,
+`application/grpc`) passes through **ungated** (fail-open recognition).
+
+### Why A2A rejections are shaped differently from MCP
+
+MCP treats a JSON-RPC error as protocol-level, so an MCP block is **HTTP 200 + `-32008`**. A2A blocks
+are **HTTP 403 + `-32010`** instead, for two reasons:
+
+- **403 is the A2A-conformant transport signal** for a well-formed but policy-denied call.
+- **`-32010` sits *outside* A2A's reserved band** `-32001..=-32009`. That band already assigns
+  `-32008 = ExtensionSupportRequiredError` and `-32009 = VersionNotSupportedError` in A2A v1.0, so
+  reusing MCP's `-32008` would collide with a real A2A error. `-32010` is the first free slot above the
+  band.
+
+On **v1.0** the `error.data` MUST carry a `google.rpc.ErrorInfo` (`reason: DATA_QUALITY_BELOW_THRESHOLD`,
+`domain: dq-gate.mulesoft.com`, plus a `metadata` map gated by `discloseScoreDetails`). On **v0.3.0**
+`error.data` is free-form and included only when disclosing. `a2a_block_response` builds this; the MCP
+`block_response` is unchanged. Both share `block_message` / `block_headers` so the wording, the
+`x-dq-gate-status: blocked` header, and the disclosure gate stay identical across protocols. The same
+A2A body is returned on both A2A transports — a REST client keys on the `403`.
+
 ## Fail-open vs fail-closed posture (a security decision)
 
 How the gate behaves when it *cannot* obtain a trustworthy score is a security decision, surfaced
@@ -92,7 +133,7 @@ through two **orthogonal** config knobs — do not conflate them:
 
 | Situation | Knob | Default | Behavior on default |
 |---|---|---|---|
-| **No score at all** — cold worker start before the first fetch, or a `failOpenOnCdgcError=false` failure with an empty cache | `blockOnUnknownScore` | `true` (fail-**closed**) | Block the request (JSON-RPC `-32008`) |
+| **No score at all** — cold worker start before the first fetch, or a `failOpenOnCdgcError=false` failure with an empty cache | `blockOnUnknownScore` | `true` (fail-**closed**) | Block the request (MCP: HTTP 200 + JSON-RPC `-32008`; A2A: HTTP 403 + JSON-RPC `-32010`) |
 | **Transient CDGC error** on an asset whose score is *already* cached | `failOpenOnCdgcError` | `true` (fail-**open** on cache) | Serve the last-known-good cached score |
 
 - **`blockOnUnknownScore` defaults fail-CLOSED.** The gate blocks rather than silently passing
