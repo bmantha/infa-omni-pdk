@@ -173,6 +173,14 @@ fn mcp_request(id: u64) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {}})
 }
 
+/// Builds a JSON-RPC 2.0 A2A call. The `method` alone selects the protocol AND version: A2A v0.3.0
+/// (`message/send`), A2A v1.0 (`SendMessage`), and A2A housekeeping (`tasks/get`, `GetTask`, ...) are
+/// mutually disjoint from each other and from MCP (`tools/call`), so no `A2A-Version` header is needed
+/// on the JSON-RPC transport (that header disambiguates only the REST send binding).
+fn a2a_request(id: u64, method: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"message": {"role": "user"}}})
+}
+
 #[pdk_test]
 async fn allows_request_when_dq_score_is_healthy() -> anyhow::Result<()> {
     let (_composite, flex_url, mock_server) = compose(90, 80).await?;
@@ -428,6 +436,197 @@ async fn block_response_declares_json_content_type_over_the_wire() -> anyhow::Re
     // Blocked request must never reach the upstream; CDGC was consulted once for the score.
     detail.assert_hits_async(1).await;
     mcp.assert_hits_async(0).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn blocks_a2a_v1_send_below_block_threshold_with_403_and_error_info() -> anyhow::Result<()> {
+    // A2A v1.0 `SendMessage` on a below-threshold asset. Unlike the MCP path (HTTP 200 + JSON-RPC
+    // -32008), an A2A rejection is a transport-level HTTP 403 carrying JSON-RPC -32010 (outside A2A's
+    // own -32001..=-32009 band) and, on v1.0, a google.rpc.ErrorInfo with the policy-owned
+    // reason/domain. The v1.0 version is inferred from the method name alone -- no A2A-Version header.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&a2a_request(1, "SendMessage"))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 403);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "blocked");
+    let body: Value = response.json().await?;
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["error"]["code"], -32010);
+    let info = &body["error"]["data"];
+    assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+    assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
+    assert_eq!(info["domain"], "dq-gate.mulesoft.com");
+    // discloseScoreDetails defaults false -> ErrorInfo is present but its metadata is empty.
+    assert_eq!(info["metadata"], json!({}));
+
+    detail.assert_hits_async(1).await;
+    upstream.assert_hits_async(0).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn blocks_a2a_v03_send_below_block_threshold_with_403_free_form() -> anyhow::Result<()> {
+    // A2A v0.3.0 `message/send`: same HTTP 403 + JSON-RPC -32010 as v1.0, but v0.3.0's error.data is
+    // free-form and (with disclosure off) omitted entirely -- there is no ErrorInfo envelope.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&a2a_request(1, "message/send"))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 403);
+    let body: Value = response.json().await?;
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["error"]["code"], -32010);
+    // v0.3.0 + disclosure off -> no error.data at all.
+    assert!(body["error"]["data"].is_null());
+
+    detail.assert_hits_async(1).await;
+    upstream.assert_hits_async(0).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn allows_a2a_send_when_dq_score_is_healthy() -> anyhow::Result<()> {
+    // A healthy score lets an A2A v1.0 `SendMessage` through to the upstream agent, tagged ok -- the
+    // score gate is protocol-agnostic on the allow path, exactly as for MCP.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (_login, _jwt, detail) = mock_cdgc(&mock_server, 95.0).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&a2a_request(1, "SendMessage"))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "ok");
+    let body: Value = response.json().await?;
+    assert_eq!(body["result"]["ok"], true);
+
+    detail.assert_hits_async(1).await;
+    upstream.assert_hits_async(1).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn a2a_housekeeping_method_passes_through_without_calling_cdgc() -> anyhow::Result<()> {
+    // A2A task/config/discovery housekeeping (here `tasks/get`) touches no asset data and is exempt:
+    // even on a below-threshold asset it must pass through ungated WITHOUT fetching a score. This is
+    // the fix for the pre-existing latent bug where everything non-exempt was gated as MCP, which
+    // would have wrongly blocked A2A housekeeping. The whole CDGC chain stays at zero hits.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (login, jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 9, "result": {"task": {}}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&a2a_request(9, "tasks/get"))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "skipped");
+
+    // Exempt housekeeping never touches CDGC...
+    login.assert_hits_async(0).await;
+    jwt.assert_hits_async(0).await;
+    detail.assert_hits_async(0).await;
+    // ...but still reaches the upstream agent.
+    upstream.assert_hits_async(1).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn blocks_a2a_rest_send_binding_below_block_threshold() -> anyhow::Result<()> {
+    // The A2A HTTP+JSON (REST) message-send binding carries a bare SendMessageRequest, NOT a JSON-RPC
+    // envelope, so it is recognized by the request path (final segment `message:send`) rather than a
+    // method string; the version comes from the A2A-Version header. A below-threshold asset must still
+    // return the A2A 403 + -32010 block. This proves the path-based recognition end-to-end through the
+    // gateway, complementing the unit-level REST binding coverage.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp/message:send"))
+        .header("A2A-Version", "1.0")
+        // A bare SendMessageRequest body -- deliberately not a JSON-RPC envelope.
+        .json(&json!({"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}}))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 403);
+    let body: Value = response.json().await?;
+    // The REST send has no JSON-RPC id; the error object echoes id null.
+    assert!(body["id"].is_null());
+    assert_eq!(body["error"]["code"], -32010);
+    // v1.0 header -> ErrorInfo envelope.
+    assert_eq!(
+        body["error"]["data"]["@type"],
+        "type.googleapis.com/google.rpc.ErrorInfo"
+    );
+
+    detail.assert_hits_async(1).await;
+    upstream.assert_hits_async(0).await;
 
     Ok(())
 }

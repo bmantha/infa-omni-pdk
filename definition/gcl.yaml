@@ -6,12 +6,12 @@ metadata:
     title: IDMC Data Quality Gate
     category: Quality of Service
     description: >-
-      Gates agent/MCP tool calls on a CDGC-governed asset's current data quality
-      score, warning or blocking requests when the score falls below configurable
-      thresholds. The score is cached and refreshed lazily, so most requests are a
-      fast local read.
+      Gates MCP tool calls and A2A message-send invocations on a CDGC-governed
+      asset's data quality score, warning or blocking when it falls below
+      configurable thresholds. The score is cached and refreshed lazily, so most
+      requests are a fast local read.
     metadata/capabilities/injectionPoint: inbound
-    metadata/capabilities/assetTypes: mcp
+    metadata/capabilities/assetTypes: mcp,a2a,a2a_v1
     metadata/interfaceScope: api,resource
 spec:
   extends:
@@ -62,7 +62,7 @@ spec:
       default: 80
       description: >-
         If the asset's current DQ score is below this value, the request is
-        rejected before it reaches the upstream MCP server.
+        rejected before it reaches the upstream MCP server or A2A agent.
     scoreAggregation:
       type: string
       default: min
@@ -104,8 +104,9 @@ spec:
       type: boolean
       default: false
       description: >-
-        When true, disclose the exact DQ score, blockThreshold, and asset id to the MCP
-        client — in the block message and via the x-dq-gate-score response header (opt-in).
+        When true, disclose the exact DQ score, blockThreshold, and asset id to the MCP or
+        A2A client — in the block message (A2A v1.0: in the ErrorInfo metadata) and via the
+        x-dq-gate-score response header (opt-in).
         When false (default, recommended), the client sees only a generic block message and
         the coarse x-dq-gate-status header (ok/warn/blocked/skipped/unknown); the exact
         score, threshold, and asset id are logged server-side only. Keeping this off prevents
