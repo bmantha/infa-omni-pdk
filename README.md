@@ -152,10 +152,12 @@ The `make release` goal also publishes the policy to Anypoint Exchange, but as a
 *For more information about releasing policies, see [Uploading Custom Policies to Exchange](https://docs.mulesoft.com/pdk/latest/policies-pdk-publish-policies).*
 
 ### Skipping unchanged definition publishes
-Both `make publish` and `make release` accept the `SKIP_UNCHANGED_DEFINITION` variable (default `true`). When enabled, the definition is not republished if its content matches the version already published in Exchange; instead the implementation asset is published with its dependency pointing at that already-published definition version. Set `SKIP_UNCHANGED_DEFINITION=false` to always republish the definition:
+`make publish` and `make release` accept an optional `SKIP_UNCHANGED_DEFINITION` variable. When set to `true`, the definition is not republished if its content matches the version already published in Exchange; instead the implementation asset is published with its dependency pointing at that already-published definition version.
+
+It is **off by default** — the variable is empty, so the underlying `--skip-unchanged-definition` flag is omitted entirely. That flag is only supported by newer `anypoint-cli-v4` releases; older CLIs (including the one used by the P4A build/publish pipeline) reject it as an unexpected argument. Opt in only on a compatible CLI:
 
 ```
-make publish SKIP_UNCHANGED_DEFINITION=false
+make publish SKIP_UNCHANGED_DEFINITION=true
 ```
 
 
