@@ -1658,4 +1658,717 @@ mod test {
         // Nonce is a decimal nanosecond count.
         assert!(a.bytes().all(|c| c.is_ascii_digit()), "nonce must be numeric: {}", a);
     }
+
+    // --- pure `&Config` helper coverage (score_store_ttl_ms, block_response) ---
+
+    /// Deserializes a [`Config`] straight from the JSON config bytes (host-native), so pure
+    /// `&Config` helpers can be exercised without spinning up the entrypoint. `deserialize_service`
+    /// only needs `Metadata::new()`, which defaults when no policy context is set -- so this works
+    /// in a plain `#[test]` exactly as the config parse inside `super::configure` does.
+    fn parsed_config(overrides: serde_json::Value) -> super::Config {
+        serde_json::from_slice(config_with(overrides).as_bytes())
+            .expect("config JSON must deserialize into Config")
+    }
+
+    #[test]
+    fn score_store_ttl_ms_derivation_pins_floor_cap_and_2x_interval() {
+        // Default refresh interval (None -> 86400s): 2x*1000 = 172_800_000 ms is below the 30-day
+        // floor (30*24*60*60*1000 = 2_592_000_000 ms), so the floor wins. Exercises the
+        // `unwrap_or(DEFAULT_REFRESH_INTERVAL_SECONDS)` branch.
+        let default_cfg = parsed_config(json!({ "refreshIntervalSeconds": null }));
+        assert_eq!(super::score_store_ttl_ms(&default_cfg), 2_592_000_000);
+
+        // Zero interval -> derived 0 -> floored at 30 days.
+        let zero_cfg = parsed_config(json!({ "refreshIntervalSeconds": 0 }));
+        assert_eq!(super::score_store_ttl_ms(&zero_cfg), 2_592_000_000);
+
+        // Negative interval -> `.max(0)` -> 0 -> floored at 30 days (never underflows).
+        let neg_cfg = parsed_config(json!({ "refreshIntervalSeconds": -5 }));
+        assert_eq!(super::score_store_ttl_ms(&neg_cfg), 2_592_000_000);
+
+        // 1_500_000s: 2x*1000 = 3_000_000_000 ms, above the 30-day floor and below the u32 cap, so
+        // the "2x refresh interval" derivation wins verbatim.
+        let mid_cfg = parsed_config(json!({ "refreshIntervalSeconds": 1_500_000 }));
+        assert_eq!(super::score_store_ttl_ms(&mid_cfg), 3_000_000_000);
+
+        // 3_000_000s: 2x*1000 = 6_000_000_000 ms exceeds u32::MAX (4_294_967_295), so the result is
+        // capped at u32::MAX.
+        let cap_cfg = parsed_config(json!({ "refreshIntervalSeconds": 3_000_000 }));
+        assert_eq!(super::score_store_ttl_ms(&cap_cfg), u32::MAX);
+    }
+
+    #[test]
+    fn block_response_discloses_no_score_available_message_when_disclose_true_and_score_none() {
+        // discloseScoreDetails=true + score=None: the block message must name the unknown-score
+        // case for the asset (lines 276-277), still served on HTTP 200 as application/json with the
+        // dedicated -32008 code and the client's rpc id echoed back.
+        let config = parsed_config(json!({ "discloseScoreDetails": true }));
+
+        let response = super::block_response(Some(json!(5)), None, &config);
+
+        assert_eq!(response.status_code(), 200);
+
+        let headers = response.headers();
+        assert!(
+            headers.iter().any(|(k, v)| *k == "content-type" && *v == "application/json"),
+            "block body is JSON-RPC and must be application/json: {headers:?}"
+        );
+        // score=None: even with disclose on, the raw score header push is guarded by `if let
+        // Some(score)`, so no x-dq-gate-score is emitted.
+        assert!(
+            !headers.iter().any(|(k, _)| *k == "x-dq-gate-score"),
+            "no score header when score is None: {headers:?}"
+        );
+        // The coarse status header is always safe to surface.
+        assert!(
+            headers.iter().any(|(k, v)| *k == "x-dq-gate-status" && *v == "blocked"),
+            "status header must be present: {headers:?}"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body().expect("block response must carry a body")).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 5);
+        assert_eq!(body["error"]["code"], -32008);
+        assert_eq!(
+            body["error"]["message"].as_str().unwrap(),
+            "Blocked by DQ Gate: no DQ score is available yet for asset 'asset-1'"
+        );
+    }
+
+    // --- DataStorage error-degradation double (pdk-runtime-model testable-helper pattern) ---
+
+    /// What the double's `get` should do on each call.
+    #[derive(Clone, Copy)]
+    enum FakeGet {
+        /// Return a hard storage error (exercises the `Err(err)` degradation arms).
+        Fail,
+        /// Return `Ok(None)` -- a cache miss (drives `write_cached_score` into its `Absent` arm).
+        Miss,
+        /// Return `Ok(Some((.., version)))` (drives `write_cached_score` into its `Cas` arm).
+        Hit(u64),
+    }
+
+    /// What the double's `store` should do on each call.
+    #[derive(Clone, Copy)]
+    enum FakeStore {
+        /// A hard (non-retriable) storage error -- must be logged and swallowed, no retry.
+        Fail,
+        /// A CAS conflict -- retriable, so the caller loops until `CAS_MAX_RETRIES` is exhausted.
+        Cas,
+        /// Success.
+        Ok,
+    }
+
+    /// A [`DataStorage`] test double that returns caller-chosen errors from `get` and/or `store`,
+    /// so the error-degradation arms of `read_cached_score`/`write_cached_score` are reachable
+    /// without a live backend. `store` calls are counted so tests can assert retry behaviour
+    /// (a hard error must NOT retry; a CAS conflict must retry the full bound then give up).
+    /// Uses a `Mutex` counter to mirror `MockDataStorage` and keep the future `Send`.
+    struct FailingDataStorage {
+        on_get: FakeGet,
+        on_store: FakeStore,
+        store_calls: Mutex<u32>,
+    }
+
+    impl FailingDataStorage {
+        fn new(on_get: FakeGet, on_store: FakeStore) -> Self {
+            Self { on_get, on_store, store_calls: Mutex::new(0) }
+        }
+
+        fn store_calls(&self) -> u32 {
+            *self.store_calls.lock().unwrap()
+        }
+    }
+
+    impl DataStorage for FailingDataStorage {
+        async fn get_keys(&self) -> Result<Vec<String>, DataStorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn store<T: Serialize>(
+            &self,
+            _key: &str,
+            _mode: &StoreMode,
+            _item: &T,
+        ) -> Result<(), DataStorageError> {
+            *self.store_calls.lock().unwrap() += 1;
+            match self.on_store {
+                FakeStore::Fail => Err(DataStorageError::Unexpected("store boom".to_string())),
+                FakeStore::Cas => Err(DataStorageError::CasMismatch),
+                FakeStore::Ok => Ok(()),
+            }
+        }
+
+        async fn get<T: DeserializeOwned>(
+            &self,
+            _key: &str,
+        ) -> Result<Option<(T, String)>, DataStorageError> {
+            match self.on_get {
+                FakeGet::Fail => Err(DataStorageError::Unexpected("get boom".to_string())),
+                FakeGet::Miss => Ok(None),
+                FakeGet::Hit(version) => {
+                    // Materialise a T from a real CachedScore so the helpers (which use
+                    // T = CachedScore) deserialize cleanly.
+                    let bytes = serde_json::to_vec(&CachedScore { score: 50.0, timestamp: 1 })
+                        .map_err(|e| DataStorageError::Unexpected(e.to_string()))?;
+                    let item: T = serde_json::from_slice(&bytes)
+                        .map_err(|e| DataStorageError::Unexpected(e.to_string()))?;
+                    Ok(Some((item, version.to_string())))
+                }
+            }
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), DataStorageError> {
+            Ok(())
+        }
+
+        async fn delete_all(&self) -> Result<(), DataStorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_cached_score_degrades_get_error_to_cache_miss() {
+        // A hard storage error on read must degrade to a cache miss (None), never propagate or
+        // panic -- so a transient storage hiccup falls back to a live CDGC fetch.
+        let store = FailingDataStorage::new(FakeGet::Fail, FakeStore::Ok);
+        assert!(block_on(super::read_cached_score(&store, "dq-score-asset-err")).is_none());
+    }
+
+    #[test]
+    fn write_cached_score_swallows_hard_error_on_cas_overwrite() {
+        // Existing entry -> CAS overwrite path. A hard (non-CasMismatch) store error must be
+        // logged and swallowed WITHOUT retrying: exactly one store attempt, and no panic.
+        let store = FailingDataStorage::new(FakeGet::Hit(7), FakeStore::Fail);
+        block_on(super::write_cached_score(
+            &store,
+            "dq-score-asset-cas-hard",
+            &CachedScore { score: 88.0, timestamp: 100 },
+        ));
+        assert_eq!(store.store_calls(), 1, "hard CAS error must not be retried");
+    }
+
+    #[test]
+    fn write_cached_score_swallows_hard_error_on_absent_insert() {
+        // Cache miss -> Absent put-if-absent path. A hard (non-CasMismatch) store error must be
+        // logged and swallowed WITHOUT retrying: exactly one store attempt, and no panic.
+        let store = FailingDataStorage::new(FakeGet::Miss, FakeStore::Fail);
+        block_on(super::write_cached_score(
+            &store,
+            "dq-score-asset-absent-hard",
+            &CachedScore { score: 88.0, timestamp: 100 },
+        ));
+        assert_eq!(store.store_calls(), 1, "hard Absent-insert error must not be retried");
+    }
+
+    #[test]
+    fn write_cached_score_swallows_read_before_persist_error() {
+        // A hard error on the read-before-write must abort the persist (log + return) BEFORE any
+        // store attempt -- so store is never called and nothing panics.
+        let store = FailingDataStorage::new(FakeGet::Fail, FakeStore::Ok);
+        block_on(super::write_cached_score(
+            &store,
+            "dq-score-asset-read-err",
+            &CachedScore { score: 88.0, timestamp: 100 },
+        ));
+        assert_eq!(store.store_calls(), 0, "a read error must abort before persisting");
+    }
+
+    #[test]
+    fn write_cached_score_exhausts_cas_retries_on_existing_entry() {
+        // Existing entry + a perpetual CAS conflict: the CAS overwrite is retriable, so the
+        // loop must retry exactly CAS_MAX_RETRIES times before giving up (final warn), not spin
+        // forever and not bail after one attempt.
+        let store = FailingDataStorage::new(FakeGet::Hit(7), FakeStore::Cas);
+        block_on(super::write_cached_score(
+            &store,
+            "dq-score-asset-cas-loop",
+            &CachedScore { score: 88.0, timestamp: 100 },
+        ));
+        assert_eq!(store.store_calls(), super::CAS_MAX_RETRIES, "CAS conflict must retry the full bound");
+    }
+
+    #[test]
+    fn write_cached_score_exhausts_cas_retries_on_absent_insert() {
+        // Cache miss + a perpetual Absent-insert conflict (another writer keeps winning the race):
+        // retriable, so the loop must retry exactly CAS_MAX_RETRIES times before giving up.
+        let store = FailingDataStorage::new(FakeGet::Miss, FakeStore::Cas);
+        block_on(super::write_cached_score(
+            &store,
+            "dq-score-asset-absent-loop",
+            &CachedScore { score: 88.0, timestamp: 100 },
+        ));
+        assert_eq!(store.store_calls(), super::CAS_MAX_RETRIES, "Absent conflict must retry the full bound");
+    }
+
+    // --- Programmable DataStorage double for the racy refresh-lock arms ---
+
+    /// Programmable [`DataStorage`] double whose `store` / `get` outcomes are scripted per call.
+    /// `MockDataStorage` executes purely sequentially (its futures never actually pend or race), so
+    /// the CAS-race and hard-error arms of `try_acquire_refresh_lock` -- a lost CAS takeover, a
+    /// storage error mid-sequence, a lock that vanishes between the failed put-if-absent and the
+    /// read -- are unreachable with it. This double lets each arm be driven deterministically by
+    /// popping a pre-loaded outcome for every `store`/`get` call in the order the function makes
+    /// them.
+    struct ScriptedStore {
+        store_results: RefCell<std::collections::VecDeque<Result<(), DataStorageError>>>,
+        get_results: RefCell<std::collections::VecDeque<Result<Option<Vec<u8>>, DataStorageError>>>,
+    }
+
+    impl ScriptedStore {
+        /// `store_results` is consumed one entry per `store()` call; `get_results` one per `get()`
+        /// call. `Ok(Some(bytes))` for a `get` are the serialized bytes of the stored value.
+        fn new(
+            store_results: Vec<Result<(), DataStorageError>>,
+            get_results: Vec<Result<Option<Vec<u8>>, DataStorageError>>,
+        ) -> Self {
+            Self {
+                store_results: RefCell::new(store_results.into()),
+                get_results: RefCell::new(get_results.into()),
+            }
+        }
+    }
+
+    impl DataStorage for ScriptedStore {
+        async fn get_keys(&self) -> Result<Vec<String>, DataStorageError> {
+            Ok(Vec::new())
+        }
+
+        async fn store<T: Serialize>(
+            &self,
+            _key: &str,
+            _mode: &StoreMode,
+            _item: &T,
+        ) -> Result<(), DataStorageError> {
+            self.store_results
+                .borrow_mut()
+                .pop_front()
+                .expect("ScriptedStore: unexpected store() call -- script exhausted")
+        }
+
+        async fn get<T: DeserializeOwned>(
+            &self,
+            _key: &str,
+        ) -> Result<Option<(T, String)>, DataStorageError> {
+            match self
+                .get_results
+                .borrow_mut()
+                .pop_front()
+                .expect("ScriptedStore: unexpected get() call -- script exhausted")
+            {
+                Ok(Some(bytes)) => {
+                    let item = serde_json::from_slice(&bytes)
+                        .map_err(|e| DataStorageError::Unexpected(e.to_string()))?;
+                    Ok(Some((item, "1".to_string())))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), DataStorageError> {
+            Ok(())
+        }
+
+        async fn delete_all(&self) -> Result<(), DataStorageError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn refresh_lock_stale_takeover_losing_cas_race_denies() {
+        // Put-if-absent fails (key exists), the held lock reads as STALE (acquired_at far in the
+        // past), so a CAS-overwrite takeover is attempted -- but another worker wins that CAS first
+        // (CasMismatch). The loser must back off and serve the cached value (Ok(false)), never
+        // wrongly believe it holds the lock.
+        let stale = serde_json::to_vec(&super::RefreshLock { acquired_at: 0 }).unwrap();
+        let store = ScriptedStore::new(
+            vec![
+                Err(DataStorageError::CasMismatch), // initial put-if-absent: key already exists
+                Err(DataStorageError::CasMismatch), // CAS takeover of the stale lock: lost the race
+            ],
+            vec![Ok(Some(stale))], // read-back: a stale holder (acquired_at = 0)
+        );
+
+        // `now` well past the 30s TTL so the held lock is classified stale (now - 0 >= TTL).
+        let now = REFRESH_LOCK_TTL_SECONDS + 100;
+        let acquired = block_on(super::try_acquire_refresh_lock(&store, "k", now)).unwrap();
+        assert!(!acquired, "losing the CAS takeover race must deny the lock, not grant it");
+    }
+
+    #[test]
+    fn refresh_lock_stale_takeover_hard_error_propagates() {
+        // As above, but the CAS-overwrite of the stale lock fails with a hard (non-CasMismatch)
+        // storage error. `try_acquire_refresh_lock` must propagate the error to the caller rather
+        // than silently deny or grant -- resolve_score then decides (it favours freshness).
+        let stale = serde_json::to_vec(&super::RefreshLock { acquired_at: 0 }).unwrap();
+        let store = ScriptedStore::new(
+            vec![
+                Err(DataStorageError::CasMismatch),
+                Err(DataStorageError::Unexpected("cas takeover write blew up".to_string())),
+            ],
+            vec![Ok(Some(stale))],
+        );
+
+        let now = REFRESH_LOCK_TTL_SECONDS + 100;
+        let result = block_on(super::try_acquire_refresh_lock(&store, "k", now));
+        assert!(
+            matches!(result, Err(DataStorageError::Unexpected(_))),
+            "a hard error taking over a stale lock must propagate, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_lock_vanished_then_reclaimed_on_retry() {
+        // Put-if-absent fails (CasMismatch), but the read-back finds nothing: the lock vanished
+        // (e.g. TTL-expired) between the failed put and the read. The atomic claim is retried once
+        // and succeeds -- this request now legitimately holds the lock (Ok(true)).
+        let store = ScriptedStore::new(
+            vec![
+                Err(DataStorageError::CasMismatch), // initial put-if-absent
+                Ok(()),                             // retry put-if-absent: claimed
+            ],
+            vec![Ok(None)], // read-back: the lock vanished
+        );
+
+        let acquired = block_on(super::try_acquire_refresh_lock(&store, "k", 1_000)).unwrap();
+        assert!(acquired, "a vanished lock must be re-claimed on the retry");
+    }
+
+    #[test]
+    fn refresh_lock_vanished_then_lost_to_concurrent_claim() {
+        // The lock vanished, but on the retry another worker has already re-created it
+        // (CasMismatch). This request must back off and serve cached (Ok(false)).
+        let store = ScriptedStore::new(
+            vec![
+                Err(DataStorageError::CasMismatch), // initial put-if-absent
+                Err(DataStorageError::CasMismatch), // retry put-if-absent: someone else got in first
+            ],
+            vec![Ok(None)], // read-back: the lock vanished
+        );
+
+        let acquired = block_on(super::try_acquire_refresh_lock(&store, "k", 1_000)).unwrap();
+        assert!(!acquired, "if another request re-claims the vanished lock first, we must back off");
+    }
+
+    #[test]
+    fn refresh_lock_vanished_retry_hard_error_propagates() {
+        // The lock vanished, and the retry put-if-absent fails with a hard (non-CasMismatch)
+        // storage error -- it must propagate rather than be swallowed into a false grant/deny.
+        let store = ScriptedStore::new(
+            vec![
+                Err(DataStorageError::CasMismatch),
+                Err(DataStorageError::Unexpected("retry claim backend down".to_string())),
+            ],
+            vec![Ok(None)],
+        );
+
+        let result = block_on(super::try_acquire_refresh_lock(&store, "k", 1_000));
+        assert!(
+            matches!(result, Err(DataStorageError::Unexpected(_))),
+            "a hard error on the vanished-lock retry must propagate, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_lock_initial_put_if_absent_hard_error_propagates() {
+        // The very first put-if-absent fails with a hard (non-CasMismatch) storage error. There is
+        // no read-back or retry -- the error propagates straight to the caller.
+        let store = ScriptedStore::new(
+            vec![Err(DataStorageError::Unexpected("store backend down".to_string()))],
+            vec![], // get must never be called on this path
+        );
+
+        let result = block_on(super::try_acquire_refresh_lock(&store, "k", 1_000));
+        assert!(
+            matches!(result, Err(DataStorageError::Unexpected(_))),
+            "a hard error on the initial put-if-absent must propagate to the caller, got {result:?}"
+        );
+    }
+
+    // --- entrypoint-driven coverage: resolve_score contention, CDGC HTTP errors, config arms ---
+
+    #[test]
+    fn stale_cache_served_without_cdgc_when_refresh_lock_still_fresh() {
+        // resolve_score contention arm: when the cached score has gone stale but a *fresh* refresh
+        // lock is still held (another request is presumed mid-refresh), this request must serve the
+        // existing cached score WITHOUT paying for its own CDGC round-trip. Distinct from the
+        // stale-refresh tests, which sleep past the 30s lock TTL so the lock is instead taken over
+        // and re-fetched.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            // refreshIntervalSeconds=1 makes the cache go stale almost immediately, while the
+            // refresh lock's fixed 30s TTL keeps the just-acquired lock fresh -- the exact window
+            // the stampede guard must serve-cached rather than re-fetch.
+            .with_config(config_with(json!({ "refreshIntervalSeconds": 1 })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        // Request 1 (t=0): cold cache -> acquires the lock, fetches 95.0 from CDGC, caches it.
+        let first = tester.request(mcp_request(1));
+        assert_eq!(first.header("x-dq-gate-status"), Some("ok"));
+        assert_eq!(*login_calls.borrow(), 1, "the first request must perform the CDGC login");
+        assert!(backend.next().is_some());
+
+        // Advance 5s: past refreshIntervalSeconds (1) so the cache is stale, but well within the
+        // 30s refresh-lock TTL so the lock acquired at t=0 is still fresh and held.
+        tester.sleep(Duration::from_secs(5));
+
+        // Request 2 (t=5): cache stale, but the fresh lock denies acquisition -> serve the cached
+        // 95.0 and DO NOT re-authenticate against CDGC.
+        let second = tester.request(mcp_request(2));
+        assert_eq!(second.status_code(), 200);
+        assert_eq!(
+            second.header("x-dq-gate-status"),
+            Some("ok"),
+            "the still-cached score must be served during refresh contention"
+        );
+        assert!(second.body().is_empty(), "a served-cached pass-through carries no error body");
+        assert!(backend.next().is_some(), "the contended request must still forward to the MCP backend");
+        assert_eq!(
+            *login_calls.borrow(),
+            1,
+            "serving the cached score during contention must NOT trigger a second CDGC fetch"
+        );
+    }
+
+    #[test]
+    fn fetch_login_http_error_blocks_as_unknown_score() {
+        // fetch_cdgc_score line ~438: the CDGC Login call returns an HTTP >= 300 status, so the
+        // refresh must abort with an error BEFORE parsing the body. With no cached score, that
+        // yields no score at all, and blockOnUnknownScore defaults closed -> -32008 block.
+        //
+        // Non-vacuous by construction: the Login response carries an OTHERWISE-VALID body and a
+        // healthy 95.0 score is registered downstream, so if the `status_code() >= 300` guard were
+        // removed the login body would parse, the chain would run to a passing score, and the
+        // request would come back "ok" instead of "blocked" -- flipping this assertion.
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let login_500 = |req: UnitHttpRequest| {
+            let path = req.header(":path").unwrap_or_default();
+            if path.starts_with("/identity-service/api/v1/Login") {
+                // >= 300 but with a valid CdgcLoginResponse body (proves the status guard, not a
+                // parse failure, is what aborts).
+                UnitHttpResponse::new(500)
+                    .with_body(json!({ "sessionId": "session-1", "orgId": "org-1" }).to_string())
+            } else if path.starts_with("/identity-service/api/v1/jwt/Token") {
+                UnitHttpResponse::new(200).with_body(json!({ "jwt_token": "test-jwt" }).to_string())
+            } else {
+                UnitHttpResponse::new(404)
+            }
+        };
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", login_500)
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(21));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            response.header("x-dq-gate-status"),
+            Some("blocked"),
+            "a login HTTP error must abort the refresh and (no cache) fail closed"
+        );
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 21);
+        assert_eq!(body["error"]["code"], -32008);
+        // No secret/body leak: the generic (disclose=false) message must not echo the upstream
+        // Login payload's sessionId nor the HTTP status code.
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("did not meet the required standard"), "got: {}", msg);
+        let raw = String::from_utf8_lossy(response.body());
+        assert!(!raw.contains("session-1"), "must not leak login sessionId: {}", raw);
+        assert!(!raw.contains("500"), "must not leak upstream status code: {}", raw);
+        // A blocked request must never reach the MCP backend.
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn fetch_jwt_http_error_blocks_as_unknown_score() {
+        // fetch_cdgc_score line ~465: Login succeeds, but the JWT Token call returns HTTP >= 300, so
+        // the refresh aborts before parsing the JWT body. No cached score -> fail closed (-32008).
+        //
+        // Non-vacuous: the JWT response carries a valid CdgcJwtResponse body and a healthy 95.0
+        // score is registered downstream, so if the jwt `status_code() >= 300` guard were removed
+        // the body would parse, the chain would reach a passing score, and the request would return
+        // "ok" instead of "blocked".
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let jwt_500 = |req: UnitHttpRequest| {
+            let path = req.header(":path").unwrap_or_default();
+            if path.starts_with("/identity-service/api/v1/Login") {
+                UnitHttpResponse::new(200)
+                    .with_body(json!({ "sessionId": "session-1", "orgId": "org-1" }).to_string())
+            } else if path.starts_with("/identity-service/api/v1/jwt/Token") {
+                // >= 300 but with a valid jwt body (proves the status guard, not a parse failure).
+                UnitHttpResponse::new(500).with_body(json!({ "jwt_token": "test-jwt" }).to_string())
+            } else {
+                UnitHttpResponse::new(404)
+            }
+        };
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", jwt_500)
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(22));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            response.header("x-dq-gate-status"),
+            Some("blocked"),
+            "a JWT HTTP error must abort the refresh and (no cache) fail closed"
+        );
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["id"], 22);
+        assert_eq!(body["error"]["code"], -32008);
+        // No secret/body leak: the JWT material must never appear in the client response.
+        let raw = String::from_utf8_lossy(response.body());
+        assert!(!raw.contains("test-jwt"), "must not leak JWT token: {}", raw);
+        assert!(!raw.contains("session-1"), "must not leak sessionId: {}", raw);
+        assert!(!raw.contains("500"), "must not leak upstream status code: {}", raw);
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn fetch_detail_http_error_blocks_as_unknown_score() {
+        // fetch_cdgc_score line ~496: Login + JWT succeed, but the CDGC Detail (dataQuality) call
+        // returns HTTP >= 300, so the refresh aborts before parsing the asset detail body. No
+        // cached score -> fail closed (-32008).
+        //
+        // The 500 here carries a VALID dataQuality body with a healthy 95.0 score, so if the detail
+        // `status_code() >= 300` guard were removed the body would parse to a passing score and the
+        // request would return "ok" instead of "blocked".
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let detail_500 = |_req: UnitHttpRequest| {
+            UnitHttpResponse::new(500)
+                .with_body(json!({ "dataQuality": [{ "core.score": 95.0 }] }).to_string())
+        };
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", detail_500)
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(23));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            response.header("x-dq-gate-status"),
+            Some("blocked"),
+            "a Detail HTTP error must abort the refresh and (no cache) fail closed"
+        );
+        let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+        assert_eq!(body["id"], 23);
+        assert_eq!(body["error"]["code"], -32008);
+        // Prove the healthy score in the (rejected) detail body was NOT used and did not leak.
+        let raw = String::from_utf8_lossy(response.body());
+        assert!(!raw.contains("95"), "the discarded detail score must not leak: {}", raw);
+        // Login+JWT were reached before the detail failure.
+        assert_eq!(*login_calls.borrow(), 1);
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn distributed_true_uses_remote_backend_and_still_gates() {
+        // distributed=true selects the gossip-replicated REMOTE DataStorage backend for BOTH the
+        // score cache and the refresh lock (the `if config.distributed` arm in `configure`).
+        // Downstream gating logic is identical to the local path: a healthy CDGC score (95, above
+        // warnThreshold 90) must still resolve, pass through, and tag the response "ok" -- proving
+        // the remote-backed `launch_policy` monomorphization wires up and runs end to end. If the
+        // remote arm failed to launch (or the remote-backed store broke resolution), the status
+        // would not be "ok" and the backend would not be reached.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "distributed": true })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+
+        let response = tester.request(mcp_request(1));
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some(), "distributed-mode traffic must still reach the MCP backend");
+        assert_eq!(*login_calls.borrow(), 1, "the remote-backed path must still resolve the score via CDGC");
+    }
+
+    #[test]
+    fn empty_body_post_passes_through_ungated() {
+        // A POST with a JSON content-type but NO body: `state.contains_body()` is false, so the
+        // filter takes the `Vec::new()` arm rather than reading a body. An empty body is not a
+        // JSON-RPC 2.0 call, so `parse_jsonrpc_call` returns None and the request fails open --
+        // proving a bodyless POST (e.g. a health probe) is never gated, even though a low CDGC
+        // score (50, below blockThreshold 80) is registered that would block a real tools/call.
+        // login_calls staying at 0 proves resolve_score was never even attempted.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&login_calls), Rc::clone(&backend));
+
+        let request = UnitHttpRequest::post()
+            .with_path("/mcp")
+            .with_header("content-type", "application/json");
+        let response = tester.request(request);
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.header("x-dq-gate-status"), Some("skipped"));
+        assert!(response.body().is_empty(), "a bodyless POST must not receive an error body");
+        assert!(backend.next().is_some());
+        assert_eq!(*login_calls.borrow(), 0, "resolve_score must not run for an empty-body request");
+    }
+
+    #[test]
+    fn soft_launch_bypass_warns_once_then_suppresses_on_repeat() {
+        // #10 soft-launch: with no score available and blockOnUnknownScore=false, EVERY request
+        // passes ungated (status "unknown"), but the BYPASS warning is emitted only ONCE per
+        // worker. Two requests on the SAME tester (same worker / same thread-local
+        // UNGATED_BYPASS_LOGGED) exercise both arms of the warn-once guard: the second request
+        // deterministically finds the flag already set (regardless of what other tests did on this
+        // thread), taking the `if first_bypass` false path -- while still passing through to the
+        // backend. This guards the "warned once per worker" contract: if the guard regressed and
+        // blocked, or failed to pass the second request through, the test fails.
+        let login_calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "blockOnUnknownScore": false })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_entrypoint(super::configure);
+
+        // First request: passes ungated (and, if this is the first bypass on this worker, warns).
+        let first = tester.request(mcp_request(1));
+        assert_eq!(first.status_code(), 200);
+        assert_eq!(first.header("x-dq-gate-status"), Some("unknown"));
+        assert!(backend.next().is_some(), "first soft-launch request must reach the backend");
+
+        // Second request on the SAME worker: still passes ungated, but the warn-once guard now
+        // suppresses the BYPASS log (the `if first_bypass` false arm).
+        let second = tester.request(mcp_request(2));
+        assert_eq!(second.status_code(), 200);
+        assert_eq!(second.header("x-dq-gate-status"), Some("unknown"));
+        assert!(second.body().is_empty(), "a soft-launch pass-through must not carry an error body");
+        assert!(backend.next().is_some(), "second soft-launch request must also reach the backend");
+        assert!(second.violation().is_none(), "an ungated pass-through must not emit a violation");
+    }
 }
