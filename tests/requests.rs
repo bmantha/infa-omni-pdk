@@ -441,11 +441,14 @@ async fn block_response_declares_json_content_type_over_the_wire() -> anyhow::Re
 }
 
 #[pdk_test]
-async fn blocks_a2a_v1_send_below_block_threshold_with_403_and_error_info() -> anyhow::Result<()> {
-    // A2A v1.0 `SendMessage` on a below-threshold asset. Unlike the MCP path (HTTP 200 + JSON-RPC
-    // -32008), an A2A rejection is a transport-level HTTP 403 carrying JSON-RPC -32010 (outside A2A's
-    // own -32001..=-32009 band) and, on v1.0, a google.rpc.ErrorInfo with the policy-owned
-    // reason/domain. The v1.0 version is inferred from the method name alone -- no A2A-Version header.
+async fn blocks_a2a_v1_send_below_block_threshold_in_band_200_with_error_info() -> anyhow::Result<()>
+{
+    // A2A v1.0 `SendMessage` on a below-threshold asset. On the JSON-RPC binding an A2A rejection is
+    // carried IN-BAND at HTTP 200 (returning an HTTP 4xx for a well-formed JSON-RPC call is a spec
+    // mistake) inside the JSON-RPC envelope with code -32010 (outside A2A's own -32001..=-32009 band).
+    // On v1.0 `error.data` is a single-element array carrying a google.rpc.ErrorInfo with the
+    // policy-owned reason/domain (pdk-a2a Shape 2). The version is inferred from the method name alone
+    // -- no A2A-Version header.
     let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
     let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
@@ -464,12 +467,16 @@ async fn blocks_a2a_v1_send_below_block_threshold_with_403_and_error_info() -> a
         .send()
         .await?;
 
-    assert_eq!(response.status(), 403);
+    assert_eq!(response.status(), 200);
     assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "blocked");
     let body: Value = response.json().await?;
+    assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 1);
     assert_eq!(body["error"]["code"], -32010);
-    let info = &body["error"]["data"];
+    // v1.0: error.data is a single-element [ErrorInfo] array (Shape 2), not a bare object.
+    let data = &body["error"]["data"];
+    assert!(data.is_array(), "v1.0 error.data must be an array: {body}");
+    let info = &data[0];
     assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
     assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
     assert_eq!(info["domain"], "dq-gate.mulesoft.com");
@@ -483,9 +490,10 @@ async fn blocks_a2a_v1_send_below_block_threshold_with_403_and_error_info() -> a
 }
 
 #[pdk_test]
-async fn blocks_a2a_v03_send_below_block_threshold_with_403_free_form() -> anyhow::Result<()> {
-    // A2A v0.3.0 `message/send`: same HTTP 403 + JSON-RPC -32010 as v1.0, but v0.3.0's error.data is
-    // free-form and (with disclosure off) omitted entirely -- there is no ErrorInfo envelope.
+async fn blocks_a2a_v03_send_below_block_threshold_in_band_200_free_form() -> anyhow::Result<()> {
+    // A2A v0.3.0 `message/send`: same in-band HTTP 200 + JSON-RPC -32010 envelope as v1.0, but
+    // v0.3.0's error.data is free-form (Shape 1) and (with disclosure off) omitted entirely -- there
+    // is no ErrorInfo envelope on Legacy.
     let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
     let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
@@ -504,8 +512,9 @@ async fn blocks_a2a_v03_send_below_block_threshold_with_403_free_form() -> anyho
         .send()
         .await?;
 
-    assert_eq!(response.status(), 403);
+    assert_eq!(response.status(), 200);
     let body: Value = response.json().await?;
+    assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 1);
     assert_eq!(body["error"]["code"], -32010);
     // v0.3.0 + disclosure off -> no error.data at all.
@@ -591,8 +600,10 @@ async fn a2a_housekeeping_method_passes_through_without_calling_cdgc() -> anyhow
 async fn blocks_a2a_rest_send_binding_below_block_threshold() -> anyhow::Result<()> {
     // The A2A HTTP+JSON (REST) message-send binding carries a bare SendMessageRequest, NOT a JSON-RPC
     // envelope, so it is recognized by the request path (final segment `message:send`) rather than a
-    // method string; the version comes from the A2A-Version header. A below-threshold asset must still
-    // return the A2A 403 + -32010 block. This proves the path-based recognition end-to-end through the
+    // method string. Unlike the JSON-RPC binding (in-band HTTP 200), the REST binding answers with a
+    // NATIVE HTTP 403 and a google.rpc.Status body (pdk-a2a Shape 3): `{error:{code,message,details}}`
+    // with `error.code` mirroring the HTTP status and `error.details` a single-element [ErrorInfo]
+    // array -- and NO jsonrpc/id fields. This proves the path-based recognition end-to-end through the
     // gateway, complementing the unit-level REST binding coverage.
     let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
@@ -614,16 +625,18 @@ async fn blocks_a2a_rest_send_binding_below_block_threshold() -> anyhow::Result<
         .send()
         .await?;
 
+    // Shape 3: native HTTP 403, google.rpc.Status body, no JSON-RPC envelope.
     assert_eq!(response.status(), 403);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "blocked");
     let body: Value = response.json().await?;
-    // The REST send has no JSON-RPC id; the error object echoes id null.
-    assert!(body["id"].is_null());
-    assert_eq!(body["error"]["code"], -32010);
-    // v1.0 header -> ErrorInfo envelope.
-    assert_eq!(
-        body["error"]["data"]["@type"],
-        "type.googleapis.com/google.rpc.ErrorInfo"
-    );
+    assert!(body.get("jsonrpc").is_none(), "REST Shape 3 has no jsonrpc field: {body}");
+    assert!(body.get("id").is_none(), "REST Shape 3 has no id field: {body}");
+    // error.code mirrors the HTTP status (403), not a JSON-RPC code.
+    assert_eq!(body["error"]["code"], 403);
+    let info = &body["error"]["details"][0];
+    assert_eq!(info["@type"], "type.googleapis.com/google.rpc.ErrorInfo");
+    assert_eq!(info["reason"], "DATA_QUALITY_BELOW_THRESHOLD");
+    assert_eq!(info["domain"], "dq-gate.mulesoft.com");
 
     detail.assert_hits_async(1).await;
     upstream.assert_hits_async(0).await;
