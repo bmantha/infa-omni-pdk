@@ -3,16 +3,15 @@ apiVersion: gateway.mulesoft.com/v1alpha1
 kind: Extension
 metadata:
   labels:
-    title: dq-gate-policy
-    category: Custom
+    title: IDMC Data Quality Gate
+    category: Quality of Service
     description: >-
-      Policy gates agent/MCP tool calls on a CDGC-governed asset's current data
-      quality score, warning or blocking requests when quality drops below
-      configurable thresholds. The score is cached in a MuleSoft Object Store with
-      a long TTL (CDGC DQ scans run roughly daily) and refreshed lazily, inline, by
-      whichever request happens to see a stale cache entry — so almost every
-      request is a fast Object Store read, not a live CDGC call.
+      Gates agent/MCP tool calls on a CDGC-governed asset's current data quality
+      score, warning or blocking requests when the score falls below configurable
+      thresholds. The score is cached and refreshed lazily, so most requests are a
+      fast local read.
     metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
 spec:
   extends:
@@ -34,6 +33,9 @@ spec:
     cdgcOrgUsername:
       type: string
       description: IDMC service-account username used to authenticate to CDGC.
+      "@context":
+        "@characteristics":
+          - security:sensitive
     cdgcOrgPassword:
       type: string
       description: IDMC service-account password.
@@ -57,7 +59,7 @@ spec:
       type: number
       minimum: 0
       maximum: 100
-      default: 70
+      default: 80
       description: >-
         If the asset's current DQ score is below this value, the request is
         rejected before it reaches the upstream MCP server.
@@ -84,41 +86,47 @@ spec:
       type: boolean
       default: true
       description: >-
-        If a stale-cache request's inline CDGC fetch fails (timeout, auth failure, 5xx),
-        keep serving the last known-good cached score when true. If false, treat a fetch
-        failure as if the score were unknown and apply blockOnUnknownScore behavior instead.
+        Posture for a *transient* CDGC error on an asset whose score is already known. If a
+        stale-cache refresh fails (timeout, auth failure, 5xx) but a last-known-good cached score
+        exists, keep serving it when true (fail-open on cache). If false, treat the failure as an
+        unknown score and apply blockOnUnknownScore instead. Orthogonal to blockOnUnknownScore:
+        this governs known-asset transient errors; that governs the no-score-at-all case.
     blockOnUnknownScore:
+      type: boolean
+      default: true
+      description: >-
+        Posture when NO score is available at all (cold worker start before the first fetch, or a
+        failOpenOnCdgcError=false failure with an empty cache). Default true = fail-CLOSED: the gate
+        blocks rather than silently passing ungated traffic during the exact windows (startup, CDGC
+        outage) an operator is least likely to notice. Set false only for a deliberate soft launch,
+        which passes such traffic through ungated (a one-time warn marks the bypass window).
+    discloseScoreDetails:
       type: boolean
       default: false
       description: >-
-        Whether to block requests when no cached score is available yet (e.g. right
-        after a fresh policy/worker start, before the first periodic fetch completes,
-        or after a failOpenOnCdgcError=false failure). Default is fail-open (pass through).
-    objectStoreAuthUrl:
-      type: string
-      format: service
-      description: "Complete OAuth token endpoint URL, e.g. https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token."
-    objectStoreUrl:
-      type: string
-      format: service
-      description: "Object Store V2 host URL, e.g. https://object-store-us-west-2.anypoint.mulesoft.com."
-    objectStoreClientId:
-      type: string
-      description: OAuth2 client ID for authenticating with the Object Store service.
-    objectStoreClientSecret:
-      type: string
-      description: OAuth2 client secret for authenticating with the Object Store service.
-      "@context":
-        "@characteristics":
-          - security:sensitive
-    objectStoreName:
-      type: string
-      default: dq-gate-store
-      description: Name of the Object Store used to persist the cached DQ score.
+        When true, disclose the exact DQ score, blockThreshold, and asset id to the MCP
+        client — in the block message and via the x-dq-gate-score response header (opt-in).
+        When false (default, recommended), the client sees only a generic block message and
+        the coarse x-dq-gate-status header (ok/warn/blocked/skipped/unknown); the exact
+        score, threshold, and asset id are logged server-side only. Keeping this off prevents
+        clients from probing threshold boundaries or learning internal asset identifiers.
+    distributed:
+      type: boolean
+      default: false
+      description: >-
+        Share the cached DQ score and refresh lock across gateway replicas via
+        gossip-replicated storage (requires shared storage configured on the
+        gateway). When false (default), each replica keeps its own in-memory
+        cache and refreshes independently.
     timeout:
       type: integer
-      default: 60000
-      description: Timeout in milliseconds for CDGC (Login/JWT/score) and Object Store HTTP requests.
+      default: 5000
+      description: >-
+        Per-call timeout in milliseconds for each CDGC HTTP request (Login, JWT, Detail). Because a
+        cache-miss request performs all three inline on the hot path, each call is additionally
+        clamped to the remaining overall refresh budget (a fixed ~10s cap on the whole chain); if
+        that budget is exhausted the refresh aborts and the unknown-score posture applies, rather
+        than blocking the agent's call unbounded.
   required:
     - cdgcLoginUrl
     - cdgcBaseApiUrl
@@ -127,8 +135,3 @@ spec:
     - cdgcAssetId
     - warnThreshold
     - blockThreshold
-    - objectStoreAuthUrl
-    - objectStoreUrl
-    - objectStoreClientId
-    - objectStoreClientSecret
-    - objectStoreName

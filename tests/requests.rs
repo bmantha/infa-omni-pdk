@@ -29,11 +29,6 @@ fn policy_config(warn_threshold: u32, block_threshold: u32) -> PolicyConfig {
             "refreshIntervalSeconds": 86400,
             "failOpenOnCdgcError": true,
             "blockOnUnknownScore": false,
-            "objectStoreAuthUrl": "http://backend/token",
-            "objectStoreUrl": "http://backend",
-            "objectStoreClientId": "test-client-id",
-            "objectStoreClientSecret": "test-client-secret",
-            "objectStoreName": "test-store",
         }))
         .build()
 }
@@ -51,6 +46,73 @@ async fn compose(warn_threshold: u32, block_threshold: u32) -> anyhow::Result<(T
         .path("/mcp/")
         .port(FLEX_PORT)
         .policies([policy_config(warn_threshold, block_threshold)])
+        .build();
+
+    let flex_config = FlexConfig::builder()
+        .version("1.13.0")
+        .hostname("local-flex")
+        .with_api(api_config)
+        .config_mounts([(POLICY_DIR, "policy"), (COMMON_CONFIG_DIR, "common")])
+        .build();
+
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+
+    let flex: Flex = composite.service()?;
+    let flex_url = flex.external_url(FLEX_PORT).unwrap();
+
+    let httpmock: HttpMock = composite.service()?;
+    let mock_server = MockServer::connect_async(httpmock.socket()).await;
+
+    Ok((composite, flex_url, mock_server))
+}
+
+/// Same base configuration as [`policy_config`], with `overrides` merged over the top so a test
+/// can flip an extra property (e.g. `discloseScoreDetails`) without duplicating the whole config.
+fn policy_config_with(warn_threshold: u32, block_threshold: u32, overrides: Value) -> PolicyConfig {
+    let mut cfg = json!({
+        "cdgcLoginUrl": "http://backend",
+        "cdgcBaseApiUrl": "http://backend",
+        "cdgcOrgUsername": "test-username",
+        "cdgcOrgPassword": "test-password",
+        "cdgcAssetId": "demo-asset-1",
+        "warnThreshold": warn_threshold,
+        "blockThreshold": block_threshold,
+        "scoreAggregation": "min",
+        "refreshIntervalSeconds": 86400,
+        "failOpenOnCdgcError": true,
+        "blockOnUnknownScore": false,
+    });
+    if let (Some(base), Some(extra)) = (cfg.as_object_mut(), overrides.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    PolicyConfig::builder()
+        .name(POLICY_NAME)
+        .configuration(cfg)
+        .build()
+}
+
+/// Like [`compose`], but installs a caller-built [`PolicyConfig`] so a test can vary policy
+/// configuration beyond the two thresholds. Kept separate from `compose` so the existing
+/// threshold-only callers are untouched.
+async fn compose_with_policy(policy: PolicyConfig) -> anyhow::Result<(TestComposite, String, MockServer)> {
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+
+    let api_config = ApiConfig::builder()
+        .name("myApi")
+        .upstream(&httpmock_config)
+        .path("/mcp/")
+        .port(FLEX_PORT)
+        .policies([policy])
         .build();
 
     let flex_config = FlexConfig::builder()
@@ -107,44 +169,15 @@ async fn mock_cdgc<'a>(mock_server: &'a MockServer, score: f64) -> (httpmock::Mo
     (login, jwt, detail)
 }
 
-// Mocks the Object Store OAuth + get/put endpoints. The policy only calls these when Flex
-// exposes organization/environment platform metadata to the filter; mounting them
-// unconditionally keeps the test correct either way without asserting on their hit counts.
-async fn mock_object_store(mock_server: &MockServer) {
-    mock_server
-        .mock_async(|when, then| {
-            when.method(httpmock::Method::POST).path("/token");
-            then.status(200)
-                .json_body(json!({"access_token": "mock-object-store-token", "expires_in": 3600}));
-        })
-        .await;
-
-    mock_server
-        .mock_async(|when, then| {
-            when.method(httpmock::Method::GET).path_contains("/stores/");
-            then.status(404);
-        })
-        .await;
-
-    mock_server
-        .mock_async(|when, then| {
-            when.method(httpmock::Method::PUT).path_contains("/stores/");
-            then.status(200);
-        })
-        .await;
-}
-
 fn mcp_request(id: u64) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {}})
 }
 
 #[pdk_test]
 async fn allows_request_when_dq_score_is_healthy() -> anyhow::Result<()> {
-    let (_composite, flex_url, mock_server) = compose(90, 70).await?;
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
     let (_login, _jwt, detail) = mock_cdgc(&mock_server, 95.0).await;
-    mock_object_store(&mock_server).await;
-
     let mcp = mock_server
         .mock_async(|when, then| {
             when.method(httpmock::Method::POST).path_contains("/mcp");
@@ -171,12 +204,56 @@ async fn allows_request_when_dq_score_is_healthy() -> anyhow::Result<()> {
 }
 
 #[pdk_test]
+async fn caches_the_dq_score_so_a_second_request_skips_cdgc() -> anyhow::Result<()> {
+    // With refreshIntervalSeconds=86400 (the policy_config default), the score fetched on the
+    // first request is served from PDK-native DataStorage on the second. The CDGC chain
+    // (Login -> JWT -> asset detail) must therefore be hit exactly once across two requests,
+    // while both requests are forwarded upstream.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (login, jwt, detail) = mock_cdgc(&mock_server, 95.0).await;
+    let mcp = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+
+    // First request: cold cache -> triggers the CDGC fetch.
+    let first = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&mcp_request(1))
+        .send()
+        .await?;
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.json::<Value>().await?["result"]["ok"], true);
+
+    // Second request within the TTL: must be a pure cache read, no CDGC round-trip.
+    let second = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&mcp_request(2))
+        .send()
+        .await?;
+    assert_eq!(second.status(), 200);
+    assert_eq!(second.json::<Value>().await?["result"]["ok"], true);
+
+    // CDGC chain hit exactly once despite two gated requests; both reached the upstream.
+    login.assert_hits_async(1).await;
+    jwt.assert_hits_async(1).await;
+    detail.assert_hits_async(1).await;
+    mcp.assert_hits_async(2).await;
+
+    Ok(())
+}
+
+#[pdk_test]
 async fn blocks_request_when_dq_score_is_below_block_threshold() -> anyhow::Result<()> {
-    let (_composite, flex_url, mock_server) = compose(90, 70).await?;
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
     let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
-    mock_object_store(&mock_server).await;
-
     let mcp = mock_server
         .mock_async(|when, then| {
             when.method(httpmock::Method::POST).path_contains("/mcp");
@@ -196,7 +273,7 @@ async fn blocks_request_when_dq_score_is_below_block_threshold() -> anyhow::Resu
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await?;
     assert_eq!(body["id"], 1);
-    assert_eq!(body["error"]["code"], -32000);
+    assert_eq!(body["error"]["code"], -32008);
 
     detail.assert_hits_async(1).await;
     mcp.assert_hits_async(0).await;
@@ -206,11 +283,9 @@ async fn blocks_request_when_dq_score_is_below_block_threshold() -> anyhow::Resu
 
 #[pdk_test]
 async fn allows_request_with_a_warning_when_dq_score_is_below_warn_threshold() -> anyhow::Result<()> {
-    let (_composite, flex_url, mock_server) = compose(90, 70).await?;
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
 
     let (_login, _jwt, detail) = mock_cdgc(&mock_server, 80.0).await;
-    mock_object_store(&mock_server).await;
-
     let mcp = mock_server
         .mock_async(|when, then| {
             when.method(httpmock::Method::POST).path_contains("/mcp");
@@ -236,6 +311,123 @@ async fn allows_request_with_a_warning_when_dq_score_is_below_warn_threshold() -
 
     detail.assert_hits_async(1).await;
     mcp.assert_hits_async(1).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn discloses_dq_score_header_when_disclose_score_details_enabled() -> anyhow::Result<()> {
+    // With discloseScoreDetails=true, an allowed (ok) response must carry the exact numeric score
+    // in the x-dq-gate-score header (formatted to 2dp), alongside the coarse x-dq-gate-status.
+    // The default (disclose=false) path -- exercised by the other allow tests -- emits status only,
+    // so this proves the opt-in disclosure branch end-to-end through the response filter.
+    let (_composite, flex_url, mock_server) =
+        compose_with_policy(policy_config_with(90, 80, json!({ "discloseScoreDetails": true }))).await?;
+
+    let (_login, _jwt, _detail) = mock_cdgc(&mock_server, 95.0).await;
+    let mcp = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&mcp_request(1))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "ok");
+    assert_eq!(response.headers().get("x-dq-gate-score").unwrap(), "95.00");
+    let body: Value = response.json().await?;
+    assert_eq!(body["result"]["ok"], true);
+
+    mcp.assert_hits_async(1).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn exempt_method_passes_through_without_calling_cdgc() -> anyhow::Result<()> {
+    // tools/list is an MCP discovery method in EXEMPT_METHODS: it must pass through ungated and,
+    // crucially, must NOT trigger a CDGC score fetch (the gate short-circuits before resolve_score).
+    // So the whole CDGC chain (Login/JWT/Detail) stays at zero hits while the request still reaches
+    // the upstream and the response is annotated with status "skipped".
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (login, jwt, detail) = mock_cdgc(&mock_server, 95.0).await;
+    let mcp = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 7, "result": {"tools": []}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "skipped");
+    let body: Value = response.json().await?;
+    assert_eq!(body["result"]["tools"], json!([]));
+
+    // Exempt methods never touch CDGC.
+    login.assert_hits_async(0).await;
+    jwt.assert_hits_async(0).await;
+    detail.assert_hits_async(0).await;
+    // ...but the request still reaches the upstream.
+    mcp.assert_hits_async(1).await;
+
+    Ok(())
+}
+
+#[pdk_test]
+async fn block_response_declares_json_content_type_over_the_wire() -> anyhow::Result<()> {
+    // A below-threshold block is a synthetic Flow::Break response built by block_response, which
+    // must set content-type: application/json (JSON-RPC clients parse the error object) and the
+    // coarse x-dq-gate-status: blocked header. This asserts those headers survive over the wire,
+    // not just the -32008 error code the other block test checks.
+    let (_composite, flex_url, mock_server) = compose(90, 80).await?;
+
+    let (_login, _jwt, detail) = mock_cdgc(&mock_server, 50.0).await;
+    let mcp = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path_contains("/mcp");
+            then.status(200)
+                .json_body(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{flex_url}/mcp"))
+        .json(&mcp_request(1))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 200);
+    assert!(response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()?
+        .contains("application/json"));
+    assert_eq!(response.headers().get("x-dq-gate-status").unwrap(), "blocked");
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["code"], -32008);
+
+    // Blocked request must never reach the upstream; CDGC was consulted once for the score.
+    detail.assert_hits_async(1).await;
+    mcp.assert_hits_async(0).await;
 
     Ok(())
 }

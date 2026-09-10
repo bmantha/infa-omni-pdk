@@ -1,4 +1,6 @@
-export PDK_COMPATIBILITY_VERSION = 1.4.0
+# Minimum PDK the policy is compatible with. Floor is 1.10: the score cache/refresh lock use the
+# DataStorage API and request_filter buffers atomically via enable_stop_iteration (see #1, #2).
+export PDK_COMPATIBILITY_VERSION = 1.10.0
 TARGET                	:= wasm32-wasip1
 TARGET_DIR            	:= target/$(TARGET)/release
 CARGO_ANYPOINT        	:= cargo-anypoint

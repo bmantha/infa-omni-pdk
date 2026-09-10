@@ -68,20 +68,77 @@ The policy is wired to two MCP connectors in Claude Desktop that share the same 
 
 | Connector | Asset DQ score | blockThreshold | Expected result |
 |---|---|---|---|
-| `parks-guests-mcp` | 90 | 80 | ✅ allowed |
-| `parks-guests-b-mcp` | 70.26 | 80 | ❌ blocked by DQ gate |
+| `parks-guests-mcp` | 95 | 80 | ✅ allowed |
+| `parks-guests-b-mcp` | 65 | 80 | ❌ blocked by DQ gate |
 
-To run the demo, simply ask Claude to call both connectors (e.g. "look up guests checking out today"). The gate rejects the low-score connector inline and returns an error message citing the score and threshold — no Docker or local Flex Gateway needed.
+To run the demo, simply ask Claude to call both connectors (e.g. "look up guests checking out today"). The gate rejects the low-score connector inline and returns a generic block error — by default it does **not** disclose the score, threshold, or asset id to the client — no Docker or local Flex Gateway needed.
 
 ### How to surface DQ Gate errors to users
 
-When a connector call fails with a DQ Gate block, **do not expose raw scores or thresholds** in the response. Instead, explain the block in plain language, for example:
+By default the policy does **not** disclose the raw DQ score, `blockThreshold`, or asset id to the MCP client: the block message is generic and only the coarse `x-dq-gate-status` header (`ok`/`warn`/`blocked`/`skipped`/`unknown`) is emitted. The exact score, threshold, and asset id are recorded in the gateway logs only. An operator can opt in to disclosing them to the client — in the block message and via the `x-dq-gate-score` header — by setting `discloseScoreDetails: true`, but that lets clients probe threshold boundaries, so it is off by default.
+
+When a connector call fails with a DQ Gate block, **do not expose raw scores or thresholds** in the response even if disclosure is enabled. Instead, explain the block in plain language, for example:
 
 > "Property B is blocked by the DQ Gate — the data quality for this source didn't meet the required standard, so results from it cannot be shown."
 
 Always tell the user *which* property or connector was blocked and that the DQ Gate was the reason. This gives enough context to follow up with an admin without exposing internal scoring details.
 
 `playground/demo.sh` exists for a self-contained Docker-based demo (two isolated Flex stacks, same contrast), but for a quick Claude Desktop demo the MCP connectors above are sufficient.
+
+## Fail-open vs fail-closed posture (a security decision)
+
+How the gate behaves when it *cannot* obtain a trustworthy score is a security decision, surfaced
+through two **orthogonal** config knobs — do not conflate them:
+
+| Situation | Knob | Default | Behavior on default |
+|---|---|---|---|
+| **No score at all** — cold worker start before the first fetch, or a `failOpenOnCdgcError=false` failure with an empty cache | `blockOnUnknownScore` | `true` (fail-**closed**) | Block the request (JSON-RPC `-32008`) |
+| **Transient CDGC error** on an asset whose score is *already* cached | `failOpenOnCdgcError` | `true` (fail-**open** on cache) | Serve the last-known-good cached score |
+
+- **`blockOnUnknownScore` defaults fail-CLOSED.** The gate blocks rather than silently passing
+  ungated traffic during exactly the windows an operator is least likely to notice (startup, a CDGC
+  outage with a cold cache). Setting it `false` is a deliberate **soft launch**: unknown-score
+  traffic passes through ungated with `x-dq-gate-status: unknown`, and a **one-shot per-worker
+  warning** (`UNGATED_BYPASS_LOGGED`) marks the window during which the control is disabled — enough
+  to be observable in the logs without flooding them.
+- **`failOpenOnCdgcError` governs a different case:** a *transient* refresh failure when a
+  last-known-good score already exists. `true` keeps serving the cached score; `false` treats the
+  failure as an unknown score and defers to `blockOnUnknownScore`. It never applies when there is no
+  cached score to fall back to.
+
+### Denials surface as PolicyViolations
+
+Every **block** path calls `violations.generate_policy_violation()` immediately before its
+`Flow::Break`, so denials appear in **Anypoint Monitoring** (see `pdk-policy-violations`). Note:
+
+- A `PolicyViolation` does **not** itself reject the request — it is telemetry. The rejection is the
+  paired `Flow::Break(block_response(...))`. Both are always emitted together on a block.
+- The `PolicyViolation` object carries only the policy name/type (the PDK API exposes no custom
+  fields), so the **asset id, score, and threshold live in the correlated `warn!` log** on the same
+  path, not on the violation object.
+- **Pass-through paths emit no violation** — a soft-launch bypass, a warn-level score, and an
+  exempt/non-MCP request are all allowed, so none is a denial. (Empirically verified in the unit
+  tests: a `Flow::Break` response carries the request-context violation through to
+  `response.violation()`, while a `Flow::Continue` response reports `None`.)
+
+## CDGC fetch latency: inline refresh + bounded budget
+
+The DQ score is refreshed **inline** — the cache-miss request that wins the refresh lock performs the
+CDGC Login → JWT → Detail chain itself, on the agent's request hot path. A background `Timer`-based
+refresher was considered and **deliberately rejected** for this iteration: it adds a separate
+scheduler with its own failure and observability surface. Inline keeps the model simple; the cost is
+**bounded, not moved**.
+
+- **Per-call timeout** (`timeout`, default 5000 ms) caps each single CDGC HTTP call.
+- **Overall refresh budget** (`CDGC_REFRESH_BUDGET_MS`, ~10s) caps the *whole* three-call chain: each
+  call's effective timeout is clamped to the budget still remaining (`next_call_timeout`), so total
+  blocking can never exceed the cap. This replaced the previous ~180s worst case (three 60s calls).
+- When the budget is exhausted the refresh **aborts** and the request falls back to the configured
+  unknown-score posture — serve last-known-good under `failOpenOnCdgcError=true`, otherwise apply
+  `blockOnUnknownScore`. The agent's call is never blocked unbounded.
+
+Time is read via the injected PDK `Clock` (`clock.now()`), never `SystemTime::now()`, so it is
+host-sourced and testable.
 
 ## Resources
 

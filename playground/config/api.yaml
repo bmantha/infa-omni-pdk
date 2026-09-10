@@ -23,7 +23,7 @@ spec:
         cdgcOrgPassword: dummy-cdgc-password
         cdgcAssetId: demo-asset-1
         warnThreshold: 90
-        blockThreshold: 70
+        blockThreshold: 80
         scoreAggregation: min
         # Shortened from the real-world 86400s (24h) default so a `PUT /score` against the
         # cdgcapi mock (see mocks/mock_server.py) is visible within a demo-friendly window,
@@ -31,8 +31,3 @@ spec:
         refreshIntervalSeconds: 30
         failOpenOnCdgcError: true
         blockOnUnknownScore: false
-        objectStoreAuthUrl: http://objectstoreauth/token
-        objectStoreUrl: http://objectstore
-        objectStoreClientId: dummy-client-id
-        objectStoreClientSecret: dummy-client-secret
-        objectStoreName: dq-gate-demo-store

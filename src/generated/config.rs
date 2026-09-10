@@ -21,24 +21,12 @@ pub struct Config {
     pub cdgc_org_password: String,
     #[serde(alias = "cdgcOrgUsername")]
     pub cdgc_org_username: String,
+    #[serde(alias = "discloseScoreDetails")]
+    pub disclose_score_details: Option<bool>,
+    #[serde(alias = "distributed")]
+    pub distributed: Option<bool>,
     #[serde(alias = "failOpenOnCdgcError")]
     pub fail_open_on_cdgc_error: Option<bool>,
-    #[serde(
-        alias = "objectStoreAuthUrl",
-        deserialize_with = "pdk::serde::deserialize_service"
-    )]
-    pub object_store_auth_url: pdk::hl::Service,
-    #[serde(alias = "objectStoreClientId")]
-    pub object_store_client_id: String,
-    #[serde(alias = "objectStoreClientSecret")]
-    pub object_store_client_secret: String,
-    #[serde(alias = "objectStoreName")]
-    pub object_store_name: String,
-    #[serde(
-        alias = "objectStoreUrl",
-        deserialize_with = "pdk::serde::deserialize_service"
-    )]
-    pub object_store_url: pdk::hl::Service,
     #[serde(alias = "refreshIntervalSeconds")]
     pub refresh_interval_seconds: Option<i64>,
     #[serde(alias = "scoreAggregation")]
@@ -59,8 +47,6 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
         })?;
     abi.service_create(config.cdgc_base_api_url)?;
     abi.service_create(config.cdgc_login_url)?;
-    abi.service_create(config.object_store_auth_url)?;
-    abi.service_create(config.object_store_url)?;
     abi.setup()?;
     Ok(())
 }
