@@ -1,0 +1,139 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: IDMC Data Classification Gate
+    category: Quality of Service
+    description: >-
+      Gates MCP tool calls and A2A message-send invocations on the CDGC data-element
+      classifications (core.sensitivity: LOW/MEDIUM/HIGH) of one or more governed columns a
+      route can return. The worst (highest-rank) classification across every governed column
+      is compared against a per-route ceiling; the whole call is blocked, not redacted, when
+      it is exceeded. Classifications are cached and refreshed lazily, so most requests are a
+      fast local read.
+    metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp,a2a,a2a_v1
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    cdgcLoginUrl:
+      type: string
+      format: service
+      description: >-
+        IDMC login base URL for this org, e.g. https://dmp-us.informaticacloud.com.
+        Region/POD prefix (dm- vs dmp-) is org-specific — do not assume, verify per org.
+    cdgcBaseApiUrl:
+      type: string
+      format: service
+      description: >-
+        CDGC base API URL for this org, e.g. https://idmc-api.dmp-us.informaticacloud.com.
+        Not reliably returned by the Login API response in all orgs — configure explicitly.
+    cdgcOrgUsername:
+      type: string
+      description: IDMC service-account username used to authenticate to CDGC.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    cdgcOrgPassword:
+      type: string
+      description: IDMC service-account password.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    governedColumnIds:
+      type: string
+      description: >-
+        Comma-separated list of internal CDGC column-asset IDs this policy instance evaluates
+        for every gated call (same ID shown in the CDGC UI's asset URL for each column). A
+        route commonly returns more than one classified column in a single tool call, so this
+        is a list rather than dq-gate-policy's single fixed cdgcAssetId. Evaluation reads each
+        column's linked classification(s) and takes the worst-case rank across the WHOLE list
+        — see maxAllowedClassification — then blocks or allows the entire call; there is no
+        per-column redaction. A column with no linked classification is treated as
+        unclassified (rank 0) and never contributes to a block on its own.
+    maxAllowedClassification:
+      type: string
+      default: MEDIUM
+      enum:
+        - LOW
+        - MEDIUM
+        - HIGH
+      description: >-
+        The rank ceiling a call is allowed to carry. Ranks today are LOW=1, MEDIUM=2, HIGH=3
+        (the only core.sensitivity values this org's CDGC schema currently defines — extending
+        the taxonomy is a CDGC/MCC schema change, not a policy config change). If the
+        worst-case classification rank across every column in governedColumnIds exceeds this
+        ceiling, the request is rejected before it reaches the upstream MCP server or A2A
+        agent; at or below the ceiling it is allowed.
+    refreshIntervalSeconds:
+      type: integer
+      default: 86400
+      minimum: 30
+      description: >-
+        Cache TTL for the resolved per-column classifications. A request only re-authenticates
+        to CDGC and refreshes the cache (fresh Login+JWT, no token caching/refresh logic) if
+        the cached entry is older than this. Data classifications change far less often than a
+        DQ scan runs, so 24h (the default) is a conservative, not just a demo, value.
+    failOpenOnCdgcError:
+      type: boolean
+      default: true
+      description: >-
+        Posture for a *transient* CDGC error when a classification result is already known. If
+        a stale-cache refresh fails (timeout, auth failure, 5xx) but a last-known-good cached
+        result exists, keep serving it when true (fail-open on cache). If false, treat the
+        failure as unknown and apply blockOnUnknownClassification instead. Orthogonal to
+        blockOnUnknownClassification: this governs known-instance transient errors; that
+        governs the no-result-at-all case.
+    blockOnUnknownClassification:
+      type: boolean
+      default: true
+      description: >-
+        Posture when NO classification result is available at all — cold worker start before
+        the first fetch, a failOpenOnCdgcError=false failure with an empty cache, OR any
+        configured column/classification asset id in governedColumnIds that CDGC cannot
+        resolve (CDGC returns HTTP 200 with an empty body for an unknown internal id, not a
+        404 — this is treated as a config-resolution error, never silently as "unclassified,
+        allow"). Default true = fail-CLOSED: the gate blocks rather than silently passing
+        ungated traffic during the exact windows an operator is least likely to notice. Set
+        false only for a deliberate soft launch, which passes such traffic through ungated (a
+        one-time warn marks the bypass window).
+    discloseClassificationDetails:
+      type: boolean
+      default: false
+      description: >-
+        When true, disclose the worst-case classification tier, maxAllowedClassification, and
+        the offending column/classification ids to the MCP or A2A client — in the block
+        message (A2A v1.0: in the ErrorInfo metadata) and via the
+        x-classification-gate-rank response header (opt-in). When false (default,
+        recommended), the client sees only a generic block message and the coarse
+        x-classification-gate-status header (ok/blocked/skipped/unknown); the exact tier,
+        ceiling, and asset ids are logged server-side only.
+    distributed:
+      type: boolean
+      default: false
+      description: >-
+        Share the cached classification results and refresh lock across gateway replicas via
+        gossip-replicated storage (requires shared storage configured on the gateway). When
+        false (default), each replica keeps its own in-memory cache and refreshes
+        independently.
+    timeout:
+      type: integer
+      default: 5000
+      description: >-
+        Per-call timeout in milliseconds for each CDGC HTTP request (Login, JWT, and every
+        batched column/classification read). Because a cache-miss request performs all of
+        these inline on the hot path, each call is additionally clamped to the remaining
+        overall refresh budget (a fixed ~10s cap on the whole chain); if that budget is
+        exhausted the refresh aborts and the unknown-classification posture applies, rather
+        than blocking the agent's call unbounded.
+  required:
+    - cdgcLoginUrl
+    - cdgcBaseApiUrl
+    - cdgcOrgUsername
+    - cdgcOrgPassword
+    - governedColumnIds
+    - maxAllowedClassification

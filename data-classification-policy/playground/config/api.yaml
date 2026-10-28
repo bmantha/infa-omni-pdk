@@ -1,0 +1,38 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /mcp/
+  policies:
+    - policyRef:
+        name: data-classification-policy-flex-v1-0 # Overridden during 'make run' execution
+        namespace: default
+      config:
+        # Points at the local cdgclogin/cdgcapi mock containers (see mocks/mock_server.py). To
+        # demo against a live CDGC org, swap in real URLs/creds locally -- never commit them.
+        cdgcLoginUrl: http://cdgclogin
+        cdgcBaseApiUrl: http://cdgcapi
+        cdgcOrgUsername: dummy-cdgc-username
+        cdgcOrgPassword: dummy-cdgc-password
+        # PATIENT_ID, FULL_NAME (MEDIUM), APPOINTMENT_DATE and VISIT_REASON (both unclassified in
+        # the mock). Worst case is MEDIUM, exactly at the ceiling -> allowed, until VISIT_REASON is
+        # linked to the HIGH "Clinical Visit Reason" classification via `PUT /classification`.
+        governedColumnIds: >-
+          9c3d6045-db8a-4bca-897a-1acc686487fa,6d26d67b-3ee3-4d23-817b-69fb91fabbb9,
+          86330022-c7c9-4e41-91c7-639f66356dab,b7e13420-4841-4bbe-86c0-002b1d9af165
+        maxAllowedClassification: MEDIUM
+        # Shortened from the real-world 86400s (24h) default so a `PUT /classification` against
+        # the cdgcapi mock is visible within a demo-friendly window.
+        refreshIntervalSeconds: 30
+        failOpenOnCdgcError: true
+        blockOnUnknownClassification: true
+        discloseClassificationDetails: true
