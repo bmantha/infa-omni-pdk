@@ -1,0 +1,139 @@
+openapi: 3.0.3
+info:
+  title: Patient Check-In MCP Tool
+  description: >-
+    Mock upstream MCP server for OCCE1B_CLINICNORTH_PATIENTCHECKIN. A single JSON-RPC 2.0
+    endpoint fronted by the Data Classification Gate policy: when the worst-case
+    core.sensitivity across governedColumnIds (PATIENT_ID, FULL_NAME, APPOINTMENT_DATE,
+    VISIT_REASON, CHECK_IN_STATUS) is at or below maxAllowedClassification, the record is
+    returned as-is; otherwise the gate blocks in-band with JSON-RPC error -32011, still at
+    HTTP 200 (JSON-RPC errors are protocol-level, not transport-level).
+  version: "1.0.0"
+servers:
+  - url: http://localhost:8081
+    description: Local playground (Flex Gateway + policy)
+paths:
+  /mcp/:
+    post:
+      operationId: callCheckInTool
+      summary: Invoke the check-in lookup tool (JSON-RPC 2.0)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonRpcRequest'
+            example:
+              jsonrpc: "2.0"
+              method: tools/call
+              id: 1
+      responses:
+        "200":
+          description: >-
+            Always HTTP 200. Body is either a JSON-RPC success result (allowed) or a
+            JSON-RPC error (blocked) — the caller must inspect the body, not the status code.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JsonRpcSuccessResponse'
+                  - $ref: '#/components/schemas/JsonRpcErrorResponse'
+              examples:
+                allowed:
+                  summary: Allowed — VISIT_REASON unclassified, worst case MEDIUM
+                  value:
+                    jsonrpc: "2.0"
+                    id: 1
+                    result:
+                      records:
+                        - patientId: P-10293
+                          fullName: Jordan Alvarez
+                          appointmentDate: "2026-09-18"
+                          visitReason: >-
+                            Routine psychiatric follow-up for anxiety management; patient
+                            reports improved mood on current sertraline dosage.
+                          checkInStatus: CHECKED_IN
+                blocked:
+                  summary: Blocked — VISIT_REASON classified HIGH, exceeds MEDIUM ceiling
+                  value:
+                    jsonrpc: "2.0"
+                    id: 1
+                    error:
+                      code: -32011
+                      message: >-
+                        Blocked by Data Classification Gate: worst-case classification tier
+                        HIGH exceeds maxAllowedClassification MEDIUM
+components:
+  schemas:
+    JsonRpcRequest:
+      type: object
+      required: [jsonrpc, method, id]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        method:
+          type: string
+          example: tools/call
+        id:
+          type: integer
+          example: 1
+        params:
+          type: object
+          additionalProperties: true
+    PatientCheckInRecord:
+      type: object
+      description: OCCE1B_CLINICNORTH_PATIENTCHECKIN row shape.
+      properties:
+        patientId:
+          type: string
+          example: P-10293
+        fullName:
+          type: string
+          example: Jordan Alvarez
+        appointmentDate:
+          type: string
+          format: date
+          example: "2026-09-18"
+        visitReason:
+          type: string
+          example: >-
+            Routine psychiatric follow-up for anxiety management; patient reports improved
+            mood on current sertraline dosage.
+        checkInStatus:
+          type: string
+          example: CHECKED_IN
+    JsonRpcSuccessResponse:
+      type: object
+      required: [jsonrpc, id, result]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          type: integer
+        result:
+          type: object
+          properties:
+            records:
+              type: array
+              items:
+                $ref: '#/components/schemas/PatientCheckInRecord'
+    JsonRpcErrorResponse:
+      type: object
+      required: [jsonrpc, id, error]
+      properties:
+        jsonrpc:
+          type: string
+          enum: ["2.0"]
+        id:
+          type: integer
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: integer
+              example: -32011
+            message:
+              type: string
