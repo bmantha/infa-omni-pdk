@@ -25,11 +25,8 @@ orientation layer; `dq-gate-policy/CLAUDE.md` / `AGENTS.md` hold the full engine
 
 Each gate owns its own JSON-RPC codes so a client keying off the code alone can tell which gate
 fired when several are stacked on one route: dq-gate `-32008` (MCP) / `-32010` (A2A),
-data-classification `-32011` (MCP) / `-32012` (A2A).
-**Known gap:** `freshness-gate-policy` still reuses dq-gate's `-32008` / `-32010`, so the two
-are indistinguishable by code when stacked; it needs its own pair (next free: `-32013` / `-32014`).
-A2A reserves `-32001..=-32009` for its own
-errors, so A2A codes stay above that range. The A2A REST binding always uses HTTP 403 +
+data-classification `-32011` (MCP) / `-32012` (A2A), freshness `-32013` (MCP) / `-32014`
+(A2A). A2A reserves `-32001..=-32009` for its own errors, so A2A codes stay above that range. The A2A REST binding always uses HTTP 403 +
 `google.rpc.Status`, with a per-gate `ErrorInfo.domain`/`reason`.
 
 ## Shared CDGC mechanics

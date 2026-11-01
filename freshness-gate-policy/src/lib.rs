@@ -32,24 +32,25 @@ const CDGC_JWT_NONCE: &str = "1234";
 
 /// JSON-RPC error code returned when an MCP request is blocked. Chosen from the JSON-RPC 2.0
 /// server-defined reserved range (`-32000..=-32099`) and deliberately NOT `-32000`, which collides
-/// with the common router/proxy "path or method not found" convention; `-32008` is this policy's
+/// with the common router/proxy "path or method not found" convention; `-32013` is this policy's
 /// dedicated "blocked by Freshness Gate" code, used consistently on both block paths
-/// (below-threshold and unknown-score).
-const JSONRPC_BLOCK_ERROR_CODE: i64 = -32008;
+/// (below-threshold and unknown-score). Distinct from dq-gate-policy's `-32008` and
+/// data-classification-policy's `-32011`, so a client keying off the code alone can tell which gate
+/// fired when several are stacked on one route -- see the monorepo root CLAUDE.md.
+const JSONRPC_BLOCK_ERROR_CODE: i64 = -32013;
 
 /// JSON-RPC error code returned when an **A2A** invocation is blocked on the JSON-RPC binding. It
-/// MUST differ from the MCP code above: A2A mints its own errors in the same JSON-RPC reserved
-/// range and has so far assigned `-32001..=-32009` (e.g. `-32008` = `ExtensionSupportRequiredError`,
-/// `-32009` = `VersionNotSupportedError`, per the A2A spec at tags v0.3.0 / v1.0.0). `-32010` is the
-/// first slot *above* A2A's currently-assigned codes, so it can never collide with an A2A-defined
-/// one -- whereas reusing the MCP code above here would collide with A2A's
-/// `ExtensionSupportRequiredError`.
-const A2A_BLOCK_ERROR_CODE: i64 = -32010;
+/// MUST differ from the MCP code above and from the other gates' A2A codes (dq-gate `-32010`,
+/// data-classification `-32012`). A2A mints its own errors in the same JSON-RPC reserved range and
+/// has so far assigned `-32001..=-32009` (e.g. `-32008` = `ExtensionSupportRequiredError`,
+/// `-32009` = `VersionNotSupportedError`, per the A2A spec at tags v0.3.0 / v1.0.0), so `-32014`
+/// sits above every code currently in use by A2A or any gate in this family.
+const A2A_BLOCK_ERROR_CODE: i64 = -32014;
 /// The A2A **HTTP+JSON (REST)** binding block returns this native HTTP status (Forbidden -- the
 /// request is well-formed but denied by policy), carrying a `google.rpc.Status` body (pdk-a2a Shape
 /// 3). The A2A **JSON-RPC** binding block, by contrast, stays HTTP 200 with the error carried
 /// in-band in the JSON-RPC envelope -- the JSON-RPC transport convention shared with MCP; only the
-/// code (`-32010`) and, on v1.0, the `google.rpc.ErrorInfo` `data` array distinguish it from an MCP
+/// code (`-32014`) and, on v1.0, the `google.rpc.ErrorInfo` `data` array distinguish it from an MCP
 /// block.
 const A2A_REST_BLOCK_HTTP_STATUS: u32 = 403;
 /// `google.rpc.ErrorInfo.reason` (UPPER_SNAKE_CASE, no "Error" suffix, per the convention) carried
@@ -267,7 +268,7 @@ enum A2aBinding {
 }
 
 /// The wire protocol a *gated* request arrived on. Selects the block-response shape: MCP -> HTTP
-/// 200 + JSON-RPC `-32008`; A2A JSON-RPC -> HTTP 200 + JSON-RPC `-32010` (a `[google.rpc.ErrorInfo]`
+/// 200 + JSON-RPC `-32013`; A2A JSON-RPC -> HTTP 200 + JSON-RPC `-32014` (a `[google.rpc.ErrorInfo]`
 /// `data` array on v1.0); A2A REST -> native HTTP 403 + a `google.rpc.Status` body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GateProtocol {
@@ -507,7 +508,7 @@ fn a2a_error_info(disclose: bool, score: Option<f64>, config: &Config) -> Value 
 /// Builds the A2A rejection for the **JSON-RPC** binding (Legacy v0.3.0 and V1). Per the
 /// A2A/JSON-RPC transport convention the failure is carried *in-band* at **HTTP 200** -- the
 /// transport succeeded, the error lives in the envelope -- exactly as for MCP; only the code
-/// ([`A2A_BLOCK_ERROR_CODE`], `-32010`) and the `error.data` shape distinguish it. On **v1.0**
+/// ([`A2A_BLOCK_ERROR_CODE`], `-32014`) and the `error.data` shape distinguish it. On **v1.0**
 /// `error.data` is a single-element array carrying a `google.rpc.ErrorInfo` (pdk-a2a Shape 2); on
 /// **v0.3.0** (Legacy) it is a free-form string (Shape 1), included only when disclosing.
 /// `discloseScoreDetails` gates what the `ErrorInfo` metadata reveals.
@@ -1352,7 +1353,7 @@ mod test {
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["jsonrpc"], "2.0");
         assert_eq!(body["id"], 42);
-        assert_eq!(body["error"]["code"], -32008);
+        assert_eq!(body["error"]["code"], -32013);
         let msg = body["error"]["message"].as_str().unwrap();
         // Default (discloseScoreDetails=false): generic message, nothing leaked to the client.
         assert!(msg.contains("did not meet the required standard"), "got: {msg}");
@@ -1503,7 +1504,7 @@ mod test {
         let response = tester.request(mcp_request(7));
 
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
-        assert_eq!(body["error"]["code"], -32008);
+        assert_eq!(body["error"]["code"], -32013);
         assert!(backend.next().is_none());
         assert!(response.violation().is_some(), "unknown-score block must emit a PolicyViolation");
     }
@@ -1591,7 +1592,7 @@ mod test {
         // In-band at HTTP 200, per the JSON-RPC transport convention shared with MCP.
         assert_eq!(response.status_code(), 200);
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
-        assert_eq!(body["error"]["code"], -32010);
+        assert_eq!(body["error"]["code"], -32014);
         let info = &body["error"]["data"][0];
         assert_eq!(info["reason"], "FRESHNESS_SCORE_BELOW_THRESHOLD");
         assert_eq!(info["domain"], "freshness-gate.mulesoft.com");
@@ -1619,7 +1620,7 @@ mod test {
         let response = tester.request(a2a_request(11, "message/send"));
 
         let body: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
-        assert_eq!(body["error"]["code"], -32010);
+        assert_eq!(body["error"]["code"], -32014);
         // v0.3 error.data is free-form and OMITTED entirely when discloseScoreDetails=false.
         assert!(body["error"].get("data").is_none());
     }

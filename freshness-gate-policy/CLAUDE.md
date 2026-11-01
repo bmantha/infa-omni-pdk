@@ -140,9 +140,9 @@ Already updated to match the above:
   response, per JSON-RPC 2.0) pass through ungated. See `classify_jsonrpc_method`,
   `a2a_rest_send_path`, `GateProtocol`/`A2aBinding`/`A2aVersion` in `lib.rs`.
 - Block responses now differ in error code by protocol/binding: MCP stays HTTP 200 +
-  `JSONRPC_BLOCK_ERROR_CODE` (`-32008`, moved off `-32000` so as not to collide with the common
+  `JSONRPC_BLOCK_ERROR_CODE` (`-32013`, moved off `-32000` so as not to collide with the common
   router/proxy "path or method not found" convention); the A2A JSON-RPC binding is HTTP 200 +
-  `A2A_BLOCK_ERROR_CODE` (`-32010`, chosen to sit just past A2A's own reserved `-32001..=-32009`
+  `A2A_BLOCK_ERROR_CODE` (`-32014`, chosen to sit past A2A's own reserved `-32001..=-32009`
   range so it can never collide with an A2A-defined error like `ExtensionSupportRequiredError`
   at `-32008`); the A2A REST binding answers with a native HTTP `403` + a `google.rpc.Status` body
   (no JSON-RPC envelope at all).
@@ -232,12 +232,12 @@ in bash with the same defaults; and the live score-mutation step used
 `wget --method=PUT`, which busybox `wget` (the only HTTP client in `python:3.12-alpine`) doesn't
 support -- replaced with a `python3 -c "...urllib.request..."` call using the image's own Python.
 Also fixed for this project's real behavior (dq-gate-policy's version assumed a wrong HTTP status):
-MCP block responses are in-band JSON-RPC errors at **HTTP 200** with `error.code == -32008`, not a
+MCP block responses are in-band JSON-RPC errors at **HTTP 200** with `error.code == -32013`, not a
 4xx/5xx, so `demo.sh`'s pass/fail checks assert on that instead of an HTTP status code.
 
 **Verified live via Docker this session** (`make build` + manual single-stack `docker compose up`,
 then the full `playground/demo.sh`): Warehouse East returns HTTP 200 with real inventory JSON;
-Warehouse West (score 62) is blocked HTTP 200 + `{"error":{"code":-32008,...}}`; mutating the
+Warehouse West (score 62) is blocked HTTP 200 + `{"error":{"code":-32008,...}}` (the MCP block code at the time; changed to `-32013` on 2026-11-01 so it no longer collides with dq-gate-policy); mutating the
 score live via `PUT /score` and waiting out the 30s `refreshIntervalSeconds` cache TTL flips West
 to passing. Both the single-stack `docker-compose.yaml` and the two-stack `demo.sh` path were run
 and torn down cleanly (`docker compose down`, `demo.sh --cleanup`).

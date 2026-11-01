@@ -274,7 +274,7 @@ wait_for_port 8082 "Stack B (Warehouse West)"
 
 # ── demo calls ────────────────────────────────────────────────────────────────
 # Note: MCP JSON-RPC errors are protocol-level, not transport-level -- the Freshness Gate
-# answers a block in-band at HTTP 200 with a JSON-RPC `error.code == -32008`, never a 4xx/5xx.
+# answers a block in-band at HTTP 200 with a JSON-RPC `error.code == -32013`, never a 4xx/5xx.
 # See src/lib.rs's `block_response` / tests/requests.rs for why.
 
 header "Demo: Stack A — Warehouse East (SLA score 100, blockThreshold 80)"
@@ -300,7 +300,7 @@ fi
 
 echo ""
 header "Demo: Stack B — Warehouse West (SLA score 62, blockThreshold 80)"
-info "Calling Stack B → expect HTTP 200 + JSON-RPC error -32008 (BLOCKED by Freshness Gate)"
+info "Calling Stack B → expect HTTP 200 + JSON-RPC error -32013 (BLOCKED by Freshness Gate)"
 echo ""
 
 RESP_B=$(curl -s -w "\n%{http_code}" -X POST http://localhost:8082/anything/mcp/ \
@@ -313,10 +313,10 @@ echo "  HTTP $CODE_B"
 echo "  Body: $BODY_B" | head -c 400
 echo ""
 
-if [[ "$CODE_B" == "200" && "$BODY_B" == *'"code":-32008'* ]]; then
-  success "Stack B BLOCKED as expected ✔ (JSON-RPC -32008)"
+if [[ "$CODE_B" == "200" && "$BODY_B" == *'"code":-32013'* ]]; then
+  success "Stack B BLOCKED as expected ✔ (JSON-RPC -32013)"
 else
-  warn "Stack B returned HTTP $CODE_B without -32008 (check logs — may need cache to populate first)"
+  warn "Stack B returned HTTP $CODE_B without -32013 (check logs — may need cache to populate first)"
 fi
 
 # ── live score mutation demo ──────────────────────────────────────────────────
@@ -347,7 +347,7 @@ echo "  HTTP $CODE_B2"
 echo "  Body: $BODY_B2" | head -c 400
 echo ""
 
-if [[ "$CODE_B2" == "200" && "$BODY_B2" != *'"code":-32008'* ]]; then
+if [[ "$CODE_B2" == "200" && "$BODY_B2" != *'"code":-32013'* ]]; then
   success "Stack B now PASSES after score update ✔"
 else
   warn "Stack B returned HTTP $CODE_B2 after score update"
@@ -357,7 +357,7 @@ fi
 echo ""
 header "Summary"
 echo -e "  Stack A (Warehouse East, score=100): HTTP ${GREEN}${CODE_A}${NC}"
-echo -e "  Stack B (Warehouse West, score=62):  HTTP ${CODE_B} with JSON-RPC ${RED}-32008${NC} → blocked by Freshness Gate"
+echo -e "  Stack B (Warehouse West, score=62):  HTTP ${CODE_B} with JSON-RPC ${RED}-32013${NC} → blocked by Freshness Gate"
 echo -e "  Stack B after score→100, TTL flush:   HTTP ${GREEN}${CODE_B2}${NC}"
 echo ""
 info "Stacks are still running. To tear down:"

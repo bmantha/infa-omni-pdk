@@ -196,7 +196,7 @@ async fn blocks_request_when_sla_score_is_below_block_threshold() -> anyhow::Res
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await?;
     assert_eq!(body["id"], 1);
-    assert_eq!(body["error"]["code"], -32008);
+    assert_eq!(body["error"]["code"], -32013);
 
     detail.assert_hits_async(1).await;
     mcp.assert_hits_async(0).await;
