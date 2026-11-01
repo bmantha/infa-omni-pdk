@@ -1,0 +1,147 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: freshness-gate-policy
+    category: Custom
+    description: >-
+      Policy gates agent/MCP tool calls on a CDGC-governed asset's current SLA/freshness
+      score, warning or blocking requests when a data source falls too far out of sync.
+      The score is cached in a MuleSoft Object Store with a long TTL and refreshed lazily,
+      inline, by whichever request happens to see a stale cache entry — so almost every
+      request is a fast Object Store read, not a live CDGC call.
+    metadata/capabilities/injectionPoint: inbound
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    cdgcLoginUrl:
+      type: string
+      format: service
+      description: >-
+        IDMC login base URL for this org, e.g. https://dmp-us.informaticacloud.com.
+        Region/POD prefix (dm- vs dmp-) is org-specific — do not assume, verify per org.
+    cdgcBaseApiUrl:
+      type: string
+      format: service
+      description: >-
+        CDGC base API URL for this org, e.g. https://idmc-api.dmp-us.informaticacloud.com.
+        Not reliably returned by the Login API response in all orgs — configure explicitly.
+    cdgcOrgUsername:
+      type: string
+      description: IDMC service-account username used to authenticate to CDGC.
+    cdgcOrgPassword:
+      type: string
+      description: IDMC service-account password.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    cdgcRuleInstanceId:
+      type: string
+      description: >-
+        Internal ID of the CDGC RuleInstance (DQ rule occurrence, not the monitored table
+        or column itself) this policy instance reads its SLA/freshness score from -- the
+        same ID shown in the CDGC UI's asset URL for that rule occurrence. CDGC's
+        `dataQuality` rollup segment only reflects RuleInstances produced by Informatica's
+        own automated ICDQ pipeline, so this policy reads the RuleInstance's own `value`
+        attribute directly instead. That `value` is computed and published externally --
+        by an upstream CDI/Data-Quality-Scorecard job in a real deployment, or by a manual
+        CDGC publish call in this demo -- never by this policy, which only reads and
+        thresholds whatever number is currently on the RuleInstance.
+    warnThreshold:
+      type: number
+      minimum: 0
+      maximum: 100
+      default: 90
+      description: >-
+        If the asset's current SLA/freshness score is below this value (and at or
+        above blockThreshold), the request is allowed through but flagged with a warning.
+    blockThreshold:
+      type: number
+      minimum: 0
+      maximum: 100
+      default: 80
+      description: >-
+        If the asset's current SLA/freshness score is below this value, the request is
+        rejected before it reaches the upstream MCP server.
+    refreshIntervalSeconds:
+      type: integer
+      default: 900
+      minimum: 30
+      description: >-
+        Cache TTL for the asset's SLA score. A request only re-authenticates to CDGC and
+        refreshes the cached score (fresh Login+JWT, no token caching/refresh logic) if
+        the cached entry is older than this. Freshness/sync SLAs move faster than
+        traditional DQ scans, so the default here (15m) is shorter than a typical DQ gate --
+        a stuck sync job should show up in enforcement well before an hour has passed.
+    discloseScoreDetails:
+      type: boolean
+      default: false
+      description: >-
+        When true, disclose the exact SLA/freshness score, blockThreshold, and RuleInstance id to
+        the MCP or A2A client -- in the block message (A2A v1.0: in the ErrorInfo metadata) and via
+        the x-freshness-gate-score response header (opt-in). Off by default so a client can't probe
+        threshold boundaries or learn asset identifiers; the full detail is always recorded
+        server-side in the gateway logs regardless.
+    failOpenOnCdgcError:
+      type: boolean
+      default: true
+      description: >-
+        If a stale-cache request's inline CDGC fetch fails (timeout, auth failure, 5xx),
+        keep serving the last known-good cached score when true. If false, treat a fetch
+        failure as if the score were unknown and apply blockOnUnknownScore behavior instead.
+        The default (true) suits read-only queries. For endpoints where the agent takes a
+        transactional or write action on the result, set this to false and blockOnUnknownScore
+        to true, so a CDGC outage blocks the action instead of letting it proceed on an
+        unverified score.
+    blockOnUnknownScore:
+      type: boolean
+      default: false
+      description: >-
+        Whether to block requests when no cached score is available yet (e.g. right
+        after a fresh policy/worker start, before the first periodic fetch completes,
+        or after a failOpenOnCdgcError=false failure). Default is fail-open (pass through),
+        appropriate for read-only queries. For endpoints gating a transactional or
+        tool-execution agent action, set this to true (paired with failOpenOnCdgcError=false)
+        so the action is blocked rather than proceeding without a verified score.
+    objectStoreAuthUrl:
+      type: string
+      format: service
+      description: "Complete OAuth token endpoint URL, e.g. https://anypoint.mulesoft.com/accounts/api/v2/oauth2/token."
+    objectStoreUrl:
+      type: string
+      format: service
+      description: "Object Store V2 host URL, e.g. https://object-store-us-west-2.anypoint.mulesoft.com."
+    objectStoreClientId:
+      type: string
+      description: OAuth2 client ID for authenticating with the Object Store service.
+    objectStoreClientSecret:
+      type: string
+      description: OAuth2 client secret for authenticating with the Object Store service.
+      "@context":
+        "@characteristics":
+          - security:sensitive
+    objectStoreName:
+      type: string
+      default: freshness-gate-store
+      description: Name of the Object Store used to persist the cached SLA score.
+    timeout:
+      type: integer
+      default: 60000
+      description: Timeout in milliseconds for CDGC (Login/JWT/score) and Object Store HTTP requests.
+  required:
+    - cdgcLoginUrl
+    - cdgcBaseApiUrl
+    - cdgcOrgUsername
+    - cdgcOrgPassword
+    - cdgcRuleInstanceId
+    - warnThreshold
+    - blockThreshold
+    - objectStoreAuthUrl
+    - objectStoreUrl
+    - objectStoreClientId
+    - objectStoreClientSecret
+    - objectStoreName

@@ -6,3 +6,4 @@ registration.yaml
 certificate.yaml
 .env
 .envrc
+playground/config/api.local.yaml

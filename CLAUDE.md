@@ -14,13 +14,19 @@ orientation layer; `dq-gate-policy/CLAUDE.md` / `AGENTS.md` hold the full engine
   `maxAllowedClassification`. Structurally mirrors `dq-gate-policy` (same DataStorage cache/lock
   split, CAS writes, latency budget, request classification, rejection shapes); the CDGC side is a
   two-hop batched read (column -> linked classifications -> their sensitivity, chunks of 5).
+- **`freshness-gate-policy`** -- gates the same traffic on one CDGC `RuleInstance`'s own
+  `selfAttributes.value` (a freshness/SLA score), not an asset rollup: CDGC only populates the
+  `dataQuality` rollup for Informatica-automated (`infa-producer.dq`) RuleInstances, so a
+  manually asserted / externally computed score has to be read off the RuleInstance directly.
+  Cloned from `dq-gate-policy` and back-ported its hardening (Clock injection, latency budget, A2A).
+  See `freshness-gate-policy/CLAUDE.md` for the CDGC object model and Publish-API mechanics.
 
 ## Block error codes are disjoint on purpose
 
 Each gate owns its own JSON-RPC codes so a client keying off the code alone can tell which gate
 fired when several are stacked on one route: dq-gate `-32008` (MCP) / `-32010` (A2A),
-data-classification `-32011` (MCP) / `-32012` (A2A). A2A reserves `-32001..=-32009` for its own
-errors, so A2A codes stay above that range. The A2A REST binding always uses HTTP 403 +
+data-classification `-32011` (MCP) / `-32012` (A2A), freshness `-32013` (MCP) / `-32014`
+(A2A). A2A reserves `-32001..=-32009` for its own errors, so A2A codes stay above that range. The A2A REST binding always uses HTTP 403 +
 `google.rpc.Status`, with a per-gate `ErrorInfo.domain`/`reason`.
 
 ## Shared CDGC mechanics
@@ -29,7 +35,7 @@ errors, so A2A codes stay above that range. The A2A REST binding always uses HTT
    -> `sessionId`, `orgId`.
 2. `GET .../identity-service/api/v1/jwt/Token?client_id=idmc_api&nonce=<value>` with
    `cookie: USER_SESSION=<sessionId>` + `IDS-SESSION-ID: <sessionId>` -> `jwt_token` (~25-30 min;
-   both policies re-authenticate on every cache-miss refresh, no token reuse).
+   all three gates re-authenticate on every cache-miss refresh, no token reuse).
 3. Content calls: `Authorization: Bearer <jwt>`, `X-INFA-ORG-ID: <orgId>` against the CDGC API host
    (configure `cdgcBaseApiUrl` explicitly -- it is not reliably returned by Login).
 
@@ -39,4 +45,4 @@ This repo is public. Never commit CDGC credentials or real org ids: the playgrou
 point at the local mock containers with dummy creds. For live testing, put real values in a local,
 uncommitted copy or environment variables, and keep `registration.yaml` / `.env` out of git (both
 are gitignored per policy). `cdgcOrgUsername` and `cdgcOrgPassword` are `security:sensitive` in
-both definitions.
+every definition.
