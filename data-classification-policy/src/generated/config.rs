@@ -32,17 +32,3 @@ pub struct Config {
     #[serde(alias = "timeout")]
     pub timeout: Option<i64>,
 }
-#[pdk::hl::entrypoint_flex]
-fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {
-    let config: Config = serde_json::from_slice(abi.get_configuration())
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Failed to parse configuration '{}'. Cause: {}",
-                String::from_utf8_lossy(abi.get_configuration()), err
-            )
-        })?;
-    abi.service_create(config.cdgc_base_api_url)?;
-    abi.service_create(config.cdgc_login_url)?;
-    abi.setup()?;
-    Ok(())
-}

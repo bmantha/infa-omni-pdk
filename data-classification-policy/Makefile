@@ -66,8 +66,15 @@ endif
 TEST ?=
 
 .PHONY: test
-test: build tests/config/registration.yaml ## Run integration tests
+test: build test-generator tests/config/registration.yaml ## Run unit and integration tests
 	@cargo test $(TEST) -- --nocapture
+
+.PHONY: test-unit test-generator
+test-unit: build-asset-files test-generator ## Run unit tests without Docker
+	@cargo test --locked --lib $(TEST)
+
+test-generator: ## Check the generated-entrypoint sanitizer
+	node --test scripts/sanitize-config.test.mjs
 
 FORMAT     ?=
 OUTPUT_PATH ?=
@@ -91,6 +98,7 @@ release: build ## Publish a release version
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@anypoint-cli-v4 pdk policy-project build-asset-files --metadata '$(ANYPOINT_METADATA_JSON)'
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
+	@node scripts/sanitize-config.mjs src/generated/config.rs
 
 .PHONY: install-cargo-anypoint
 install-cargo-anypoint:

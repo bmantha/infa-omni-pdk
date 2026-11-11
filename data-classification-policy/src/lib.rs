@@ -15,6 +15,22 @@ use serde_json::Value;
 
 use crate::generated::config::Config;
 
+fn parse_config(bytes: &[u8]) -> Result<Config> {
+    // Serde's Display may contain input values; retain only non-sensitive diagnostics.
+    serde_json::from_slice(bytes).map_err(|err| {
+        anyhow!("configuration: invalid JSON ({:?}, line {}, column {})", err.classify(), err.line(), err.column())
+    })
+}
+
+#[pdk::hl::entrypoint_flex]
+fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<()> {
+    let config = parse_config(abi.get_configuration())?;
+    abi.service_create(config.cdgc_base_api_url)?;
+    abi.service_create(config.cdgc_login_url)?;
+    abi.setup()?;
+    Ok(())
+}
+
 /// Namespaces for the two PDK-native [`DataStorage`] instances this policy uses -- mirrors
 /// dq-gate-policy's cache/lock split (different lifetimes, different remote-namespace TTLs).
 const RANK_CACHE_NAMESPACE: &str = "classification-gate-rank";
@@ -1088,13 +1104,7 @@ async fn configure(
     clock: Clock,
     violations: PolicyViolations,
 ) -> Result<()> {
-    let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
-        anyhow!(
-            "Failed to parse configuration '{}'. Cause: {}",
-            String::from_utf8_lossy(&bytes),
-            err
-        )
-    })?;
+    let config = parse_config(&bytes)?;
 
     if config.distributed.unwrap_or(false) {
         let rank_store = storage_builder.remote(RANK_CACHE_NAMESPACE, rank_store_ttl_ms(&config));
@@ -1176,6 +1186,94 @@ mod test {
             base[key] = value.clone();
         }
         base.to_string()
+    }
+
+    #[test]
+    fn configuration_errors_omit_credentials_and_untrusted_values() {
+        for overrides in [
+            json!({ "timeout": "INVALID_FIELD_MARKER" }),
+            json!({ "distributed": { "INVALID_FIELD_MARKER": "PASSWORD_MARKER" } }),
+            json!({ "cdgcLoginUrl": "INVALID_FIELD_MARKER" }),
+            json!({ "cdgcOrgPassword": { "INVALID_FIELD_MARKER": "PASSWORD_MARKER" } }),
+        ] {
+            let mut input: Value = serde_json::from_str(&config_with(overrides)).unwrap();
+            input["cdgcOrgUsername"] = json!("USERNAME_MARKER");
+            if input["cdgcOrgPassword"].is_string() {
+                input["cdgcOrgPassword"] = json!("PASSWORD_MARKER");
+            }
+            let err = super::parse_config(input.to_string().as_bytes()).unwrap_err();
+            let rendered = format!("{err:#}");
+            assert!(rendered.starts_with("configuration: invalid JSON ("));
+            assert!(rendered.contains("line ") && rendered.contains("column "));
+            assert!(err.source().is_none(), "raw Serde error must not remain in the error chain");
+            for marker in ["USERNAME_MARKER", "PASSWORD_MARKER", "INVALID_FIELD_MARKER"] {
+                assert!(!rendered.contains(marker), "configuration error leaked {marker}");
+            }
+        }
+        let input = br#"{"cdgcOrgUsername":"USERNAME_MARKER","cdgcOrgPassword":"PASSWORD_MARKER","timeout": "#;
+        let err = format!("{:#}", super::parse_config(input).unwrap_err());
+        assert!(err.contains("Eof"));
+        assert!(!err.contains("USERNAME_MARKER") && !err.contains("PASSWORD_MARKER"));
+    }
+
+    #[test]
+    fn valid_configuration_preserves_credentials_and_services() {
+        let parsed = super::parse_config(config().as_bytes()).unwrap();
+        assert_eq!(parsed.cdgc_org_username, "test-user");
+        assert_eq!(parsed.cdgc_org_password, "test-pass");
+        assert_eq!(parsed.cdgc_login_url.uri().authority(), "cdgclogin");
+        assert_eq!(parsed.cdgc_base_api_url.uri().authority(), "cdgcapi");
+    }
+
+    #[test]
+    fn flex_initialization_rejects_invalid_config_before_registering_services() {
+        use pdk::flex_abi::api::{metadata::PolicyMetadata, status::Status, FlexAbi};
+        use pdk::hl::Service;
+
+        struct TestAbi {
+            config: Vec<u8>,
+            services: RefCell<Vec<String>>,
+            setup_called: RefCell<bool>,
+        }
+
+        impl FlexAbi for TestAbi {
+            fn get_policy_metadata(&self) -> &PolicyMetadata { panic!("unused metadata") }
+            fn get_configuration(&self) -> &Vec<u8> { &self.config }
+            fn log_trace(&self, _: &str) { panic!("unexpected logging") }
+            fn log_debug(&self, _: &str) { panic!("unexpected logging") }
+            fn log_info(&self, _: &str) { panic!("unexpected logging") }
+            fn log_warn(&self, _: &str) { panic!("unexpected logging") }
+            fn log_error(&self, _: &str) { panic!("unexpected logging") }
+            fn service_create(&self, service: Service) -> Result<(), Status> {
+                self.services.borrow_mut().push(service.uri().authority().to_string());
+                Ok(())
+            }
+            fn setup(&self) -> Result<(), Status> {
+                *self.setup_called.borrow_mut() = true;
+                Ok(())
+            }
+        }
+
+        let mut abi = TestAbi {
+            config: config_with(json!({
+                "cdgcOrgUsername": "USERNAME_MARKER",
+                "cdgcOrgPassword": "PASSWORD_MARKER",
+                "timeout": "INVALID_FIELD_MARKER",
+            })).into_bytes(),
+            services: RefCell::new(Vec::new()),
+            setup_called: RefCell::new(false),
+        };
+        let err = format!("{:#}", super::init(&abi).unwrap_err());
+        for marker in ["USERNAME_MARKER", "PASSWORD_MARKER", "INVALID_FIELD_MARKER"] {
+            assert!(!err.contains(marker));
+        }
+        assert!(abi.services.borrow().is_empty());
+        assert!(!*abi.setup_called.borrow());
+
+        abi.config = config().into_bytes();
+        super::init(&abi).unwrap();
+        assert_eq!(*abi.services.borrow(), ["cdgcapi", "cdgclogin"]);
+        assert!(*abi.setup_called.borrow());
     }
 
     fn mcp_request(id: i64) -> UnitHttpRequest {

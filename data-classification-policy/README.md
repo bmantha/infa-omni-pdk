@@ -41,10 +41,27 @@ keeps serving it.
 
 ```bash
 make build            # definition + wasm
-cargo test --lib      # unit tests
+make test-unit        # regenerate safely + unit and generator tests (no Docker)
 make test             # integration tests (Docker)
 make run              # playground against the mock CDGC containers (playground/config/api.yaml)
 ```
+
+Builds require Node.js for the post-generation security guard. `make build` removes the SDK's
+raw-configuration-logging initializer and uses the hand-authored initializer in `src/lib.rs`.
+Both startup paths report configuration parse failures using only category, line, and column,
+never the input or Serde's error text. Unexpected generator output fails the build and leaves a
+compilation error in place, not an unsafe initializer. Do not run `config-gen` directly and then
+compile; use the Make targets so the guard runs. This change does not sanitize CDGC response
+errors or constitute a complete security review of this policy.
+
+Local verification (2026-11-11, PDK 1.10.0 / Flex Gateway 1.13.0): `make test-unit`
+passed 27 unit tests and 3 generator tests; `make build` produced the WASM and policy assets;
+`make test` passed all 9 Docker integration tests against mock CDGC services. Configuration
+regressions cover secret-bearing type errors, invalid service values, truncated JSON, absence of
+the original error chain, and rejection before Flex service registration or setup. Generator
+regressions cover unexpected service registrations, duplicate initializers, trailing code, and
+fail-closed output. Malformed-configuration gateway logs were not separately tested in Docker;
+the direct initializer test asserts its returned error and absence of ABI logging.
 
 The mock `cdgcapi` (see `playground/mocks/mock_server.py`) starts with VISIT_REASON unclassified, so
 the default playground config is allowed at the MEDIUM ceiling. Linking it to the HIGH "Clinical
