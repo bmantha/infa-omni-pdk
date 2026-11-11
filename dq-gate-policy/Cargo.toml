@@ -1,7 +1,7 @@
 # Copyright 2026 Salesforce, Inc. All rights reserved.
 [package]
 name = "dq_gate_policy"
-version = "1.0.0"
+version = "1.0.1"
 rust-version = "1.89.0"
 edition = "2021"
 resolver = "2"
