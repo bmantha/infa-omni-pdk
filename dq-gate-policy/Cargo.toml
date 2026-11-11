@@ -30,8 +30,10 @@ pdk-test = { version = "1.10.0" }
 # default stop mode to BodyThenRequests so a paused headers event buffers the body and
 # into_headers_body_state() resolves. Without it the combined-state await spins forever (see #2).
 pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
-httpmock = "0.6"
-reqwest = { version = "0.11", default-features = false, features = ["json"] }
+# Match the remote server version in tests/common; no embedded server or TLS is needed.
+httpmock = { version = "=0.8.3", default-features = false, features = ["remote"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["time"] }
 
 [lib]
 crate-type = ["cdylib"]

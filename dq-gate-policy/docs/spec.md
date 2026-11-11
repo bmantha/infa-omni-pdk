@@ -96,7 +96,7 @@ A2A v1 JSON-RPC errors carry a single-element `google.rpc.ErrorInfo` array; REST
 - Each CDGC response has a 1 MiB post-buffer check. High-level HTTP has already buffered the response: this is NOT a network-memory bound. Gateway/egress response buffering and timeouts must be configured independently.
 - HTTPS scheme validation does not establish trusted destinations. Require external egress destination allowlisting and TLS trust allowlisting for login and API services.
 - Local mode uses the configured services and selected storage backend; it does not implicitly enable HTTP or substitute a local backend when remote extraction/runtime operations fail.
-- Pending release blockers: dependency advisory scan, real-topology buffer/timeout/auth/bypass/direct-backend verification, TLS/egress verification, and multi-replica gossip/concurrency verification. No production-readiness claim until these are complete.
+- Dependency advisory scans now pass. Pending release blockers: real-topology buffer/timeout/auth/bypass/direct-backend verification, TLS/egress verification, and multi-replica gossip/concurrency verification. Local buffer/idle controls pass, but the opt-in TLS policy-callout positive control fails on Flex 1.13.0/PDK 1.10.0. See `security-verification.md` for evidence and limitations. No production-readiness claim until these are complete.
 
 ## Architecture
 

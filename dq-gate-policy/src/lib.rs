@@ -3257,6 +3257,38 @@ mod test {
     }
 
     #[test]
+    fn gossip_replication_gap_allows_duplicate_locks_and_divergent_local_score_winners() {
+        // Independent views model withheld replication, not a linearizable shared store.
+        let replica_a = MockDataStorage::new();
+        let replica_b = MockDataStorage::new();
+        let lock_key = "dq-refresh-lock-asset-1";
+        let score_key = "dq-score-asset-1";
+        let observation_a = CachedScore { score: 95.0, timestamp: 1_000 };
+        let observation_b = CachedScore { score: 65.0, timestamp: 1_001 };
+
+        assert!(block_on(super::try_acquire_refresh_lock(&replica_a, lock_key, 1_000)).unwrap());
+        assert!(block_on(super::try_acquire_refresh_lock(&replica_b, lock_key, 1_001)).unwrap());
+        for (replica, acquired_at) in [(&replica_a, 1_000), (&replica_b, 1_001)] {
+            let (lock, version) = block_on(replica.get::<super::RefreshLock>(lock_key)).unwrap().unwrap();
+            assert_eq!(lock.acquired_at, acquired_at);
+            assert_eq!(version, "1");
+        }
+
+        // B accepts the newer observation first; A still cannot see it and accepts the older one.
+        assert_eq!(block_on(super::write_cached_score(&replica_b, score_key, &observation_b)), Some(65.0));
+        assert_eq!(block_on(super::write_cached_score(&replica_a, score_key, &observation_a)), Some(95.0));
+
+        let older = CachedScore { score: 80.0, timestamp: 999 };
+        for (replica, expected) in [(&replica_a, &observation_a), (&replica_b, &observation_b)] {
+            assert_eq!(block_on(super::write_cached_score(replica, score_key, &older)), Some(expected.score));
+            let (winner, version) = block_on(replica.get::<CachedScore>(score_key)).unwrap().unwrap();
+            assert_eq!(winner.score, expected.score);
+            assert_eq!(winner.timestamp, expected.timestamp);
+            assert_eq!(version, "1", "rejecting an older observation must not write locally");
+        }
+    }
+
+    #[test]
     fn older_or_equal_observations_cannot_overwrite_blocking_winner() {
         let store = MockDataStorage::new();
         let winner = CachedScore { score: 50.0, timestamp: 100 };
