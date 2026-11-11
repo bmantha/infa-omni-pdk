@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "data_classification_policy"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "httpmock",
