@@ -18,6 +18,7 @@ spec:
         namespace: default
       config:
         cdgcLoginUrl: http://cdgclogin
+        allowInsecureLocalServices: true
         cdgcBaseApiUrl: http://cdgcapi
         cdgcOrgUsername: dummy-cdgc-username
         cdgcOrgPassword: dummy-cdgc-password

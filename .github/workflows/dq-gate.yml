@@ -1,0 +1,46 @@
+name: DQ Gate Checks
+
+on:
+  push:
+    paths:
+      - 'dq-gate-policy/**'
+      - '.github/workflows/dq-gate.yml'
+  pull_request:
+    paths:
+      - 'dq-gate-policy/**'
+      - '.github/workflows/dq-gate.yml'
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: '1.90.0'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: dq-gate-policy
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Install build tools
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --target wasm32-wasip1
+          npm install --global anypoint-cli-v4-public@1.6.28
+          anypoint-cli-v4 plugins:install anypoint-pdk-plugin@1.10.0
+          make install-cargo-anypoint
+          cargo fetch --locked
+      - name: Unit tests
+        run: make test-unit
+      - name: Build WASM and policy assets
+        run: make build
+      - name: Dependency advisories
+        if: always()
+        run: make advisory

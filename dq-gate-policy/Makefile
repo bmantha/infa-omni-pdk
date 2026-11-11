@@ -4,6 +4,9 @@ export PDK_COMPATIBILITY_VERSION = 1.10.0
 TARGET                	:= wasm32-wasip1
 TARGET_DIR            	:= target/$(TARGET)/release
 CARGO_ANYPOINT        	:= cargo-anypoint
+CARGO_ANYPOINT_VERSION := 1.10.0
+CARGO_LLVM_COV_VERSION := 0.9.1
+CARGO_AUDIT_VERSION    := 0.23.0
 FLAGS                  	= 
 DEFINITION_NAME        	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-name)
 DEFINITION_NAMESPACE   	= $(shell anypoint-cli-v4 pdk policy-project definition get gcl-metadata-namespace)
@@ -35,7 +38,7 @@ endif
 
 .PHONY: setup
 setup: install-cargo-anypoint install-llvm-cov ## Setup Cargo Anypoint to build, LLVM-cov for coverage
-	cargo fetch
+	cargo fetch --locked
 
 playground/config/registration.yaml tests/config/registration.yaml: ## Generate a disconnected registration.yaml from the local flex gateway
 	docker image pull $(FLEX_IMAGE)
@@ -43,7 +46,7 @@ playground/config/registration.yaml tests/config/registration.yaml: ## Generate 
 
 .PHONY: build
 build: build-asset-files ## Build the policy definition and implementation
-	@$(FLAGS) cargo build --target $(TARGET) --release
+	@$(FLAGS) cargo build --locked --target $(TARGET) --release
 	@cp "$(DEFINITION_GCL_PATH)" "$(TARGET_DIR)/$(CRATE_NAME)_definition.yaml"
 	@cargo anypoint gcl-gen -d $(DEFINITION_NAME) -n $(DEFINITION_NAMESPACE) -w $(TARGET_DIR)/$(CRATE_NAME).wasm -o $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml
 	@echo $(POLICY_REF_NAME) > target/policy-ref-name.txt
@@ -66,8 +69,20 @@ endif
 TEST ?=
 
 .PHONY: test
-test: build tests/config/registration.yaml ## Run integration tests
-	@cargo test $(TEST) -- --nocapture
+test: build test-generator tests/config/registration.yaml ## Run unit and integration tests
+	@cargo test --locked $(TEST) -- --nocapture
+
+.PHONY: test-unit test-generator security advisory
+test-unit: build-asset-files test-generator ## Run unit tests without Docker
+	@cargo test --locked --lib $(TEST) -- --nocapture
+
+test-generator: ## Check the generated-entrypoint sanitizer
+	node --test scripts/sanitize-config.test.mjs
+
+security: test-unit advisory ## Run unit security regressions and dependency advisories
+
+advisory: install-cargo-audit ## Audit the checked-in dependency lockfile
+	cargo audit --file Cargo.lock
 
 FORMAT     ?=
 OUTPUT_PATH ?=
@@ -77,29 +92,34 @@ _COVERAGE_OUTPUT = $(if $(OUTPUT_PATH),--output-path $(OUTPUT_PATH),)
 
 .PHONY: test-coverage
 test-coverage: build tests/config/registration.yaml ## Run tests with coverage. Opts: FORMAT=json|html, OUTPUT_PATH=/my/path
-	cargo llvm-cov test $(_COVERAGE_FORMAT) $(_COVERAGE_OUTPUT) --ignore-filename-regex config.rs -- --nocapture
+	cargo llvm-cov test --locked $(_COVERAGE_FORMAT) $(_COVERAGE_OUTPUT) --ignore-filename-regex config.rs -- --nocapture
 
 .PHONY: publish
-publish: build ## Publish a development version of the policy
+publish: test ## Publish a development version of the policy after tests
 	anypoint-cli-v4 pdk policy-project publish --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml $(_SKIP_UNCHANGED_DEFINITION_FLAG)
 
 .PHONY: release
-release: build ## Publish a release version
+release: test advisory ## Publish a release version after tests and advisory checks
 	anypoint-cli-v4 pdk policy-project release --binary-path $(TARGET_DIR)/$(CRATE_NAME).wasm --implementation-gcl-path $(TARGET_DIR)/$(CRATE_NAME)_implementation.yaml $(_SKIP_UNCHANGED_DEFINITION_FLAG)
 
 .PHONY: build-asset-files
 build-asset-files: $(DEFINITION_SRC_GCL_PATH)
 	@anypoint-cli-v4 pdk policy-project build-asset-files --metadata '$(ANYPOINT_METADATA_JSON)'
 	@cargo anypoint config-gen -p -m $(DEFINITION_SRC_GCL_PATH) -o src/generated/config.rs
+	@node scripts/sanitize-config.mjs src/generated/config.rs
 
 .PHONY: install-cargo-anypoint
 install-cargo-anypoint:
-	cargo install cargo-anypoint@1.10.0
+	cargo install --locked cargo-anypoint@$(CARGO_ANYPOINT_VERSION)
 
 .PHONY: install-llvm-cov
 install-llvm-cov:
 	rustup component add llvm-tools-preview
-	cargo install cargo-llvm-cov
+	cargo install --locked cargo-llvm-cov@$(CARGO_LLVM_COV_VERSION)
+
+.PHONY: install-cargo-audit
+install-cargo-audit:
+	cargo install --locked cargo-audit@$(CARGO_AUDIT_VERSION)
 
 .PHONY: show-policy-ref-name
 show-policy-ref-name:

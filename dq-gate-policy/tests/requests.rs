@@ -19,6 +19,7 @@ fn policy_config(warn_threshold: u32, block_threshold: u32) -> PolicyConfig {
         .name(POLICY_NAME)
         .configuration(json!({
             "cdgcLoginUrl": "http://backend",
+            "allowInsecureLocalServices": true,
             "cdgcBaseApiUrl": "http://backend",
             "cdgcOrgUsername": "test-username",
             "cdgcOrgPassword": "test-password",
@@ -75,6 +76,7 @@ async fn compose(warn_threshold: u32, block_threshold: u32) -> anyhow::Result<(T
 fn policy_config_with(warn_threshold: u32, block_threshold: u32, overrides: Value) -> PolicyConfig {
     let mut cfg = json!({
         "cdgcLoginUrl": "http://backend",
+        "allowInsecureLocalServices": true,
         "cdgcBaseApiUrl": "http://backend",
         "cdgcOrgUsername": "test-username",
         "cdgcOrgPassword": "test-password",

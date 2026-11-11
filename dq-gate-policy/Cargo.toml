@@ -2,7 +2,7 @@
 [package]
 name = "dq_gate_policy"
 version = "1.0.0"
-rust-version = "1.88.0"
+rust-version = "1.89.0"
 edition = "2021"
 resolver = "2"
 

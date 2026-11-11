@@ -18,6 +18,12 @@ spec:
     - name: extension-definition
       namespace: default
   properties:
+    allowInsecureLocalServices:
+      type: boolean
+      default: false
+      description: >-
+        Local mock testing only. Allows HTTP to configured CDGC services. Never enable
+        in production; production services require HTTPS and approved egress destinations.
     cdgcLoginUrl:
       type: string
       format: service
@@ -121,6 +127,8 @@ spec:
         cache and refreshes independently.
     timeout:
       type: integer
+      minimum: 1
+      maximum: 10000
       default: 5000
       description: >-
         Per-call timeout in milliseconds for each CDGC HTTP request (Login, JWT, Detail). Because a

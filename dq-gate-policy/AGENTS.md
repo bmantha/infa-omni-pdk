@@ -56,7 +56,7 @@ These cause real bugs in production policies. Watch for them before writing code
 - **State machine consumes ownership.** `RequestState` → `RequestHeadersState` → `RequestBodyState` (and the response-side equivalents) each transition consumes the previous state. Read everything you need from headers before transitioning to the body — you cannot go back.
 - **Check `contains_body()` before reading or writing the body.** On a bodyless request (GET, HEAD, empty POST) `.body()` returns an empty buffer, and writes to it will not reach upstream — you can't add a body that wasn't there in the first place.
 - **Definition defaults arrive pre-filled.** Flex Gateway applies `default` values from the policy definition before the configuration bytes reach the policy, so a `required: true` property with a `default` is never absent at parse time. Do not write code that branches on "missing required field".
-- **Always include the raw config bytes in parse-error logs** (via `String::from_utf8_lossy`). Without them the operator cannot debug why the policy refused to load.
+- **Never log credentials or raw config bytes.** Do not log passwords, usernames used as credentials, tokens, cookies, Authorization headers, or CDGC response bodies. Configuration parse errors should report only a safe stage/category and line/column, never the input or secret-bearing parser text.
 - **`Flow::Break(response)` rejects, `Flow::Continue(())` allows.** Inverting these is a security hole: an auth filter that returns `Continue` on failure passes the unauthenticated request to the upstream.
 - **Response filter must handle `RequestData::Break`.** If the request was rejected by an earlier filter, the response filter receives `Break(response)`, not `Continue(data)`. `.unwrap()` on a `Break` will crash.
 - **Header names are case-insensitive.** Lowercase both sides before comparing (`name.to_ascii_lowercase()`); production policies do this consistently.
@@ -89,9 +89,16 @@ Always tell the user *which* property or connector was blocked and that the DQ G
 
 The gate is **protocol-aware but score-agnostic**: the DQ-score decision (allow / warn / block) is one
 piece of logic; how a request is *recognized* and how a *rejection is shaped* branch by protocol. Two
-recognition paths feed the same score gate (both only after the POST + `application/json` guards):
+recognition paths feed the same score gate. Non-POST and non-`application/json` requests are excluded
+at headers, before body buffering or score lookup. JSON POSTs are then size-checked and parsed:
+malformed or over-depth JSON returns HTTP 400, and bodies over 1 MiB (1,048,576 bytes) return HTTP
+413 (declared Content-Length can reject early). Among valid JSON POSTs, REST path recognition wins:
 
-1. **JSON-RPC 2.0 envelope** — shared by MCP and the A2A JSON-RPC transport. The **method name alone**
+1. **A2A HTTP+JSON (REST) send binding** — a final path segment `message:send` or `message:stream`
+   takes precedence over JSON-RPC content. An exempt method, notification, or missing `id` in a
+   JSON-RPC-looking body cannot bypass a matched REST path. The v1.0 REST rejection is HTTP 403
+   with `google.rpc.Status`; no JSON-RPC version inference is needed.
+2. **JSON-RPC 2.0 envelope** — shared by MCP and the A2A JSON-RPC transport. The **method name alone**
    classifies both the protocol and, for A2A, the version, because the three method vocabularies are
    mutually disjoint (`classify_jsonrpc_method`):
    - **MCP gated:** `tools/call`, `resources/read`, `prompts/get`.
@@ -100,14 +107,11 @@ recognition paths feed the same score gate (both only after the POST + `applicat
    - **Exempt (pass-through, no score fetch):** MCP handshake/discovery (`initialize`, `tools/list`, …)
      and A2A housekeeping — v0.3.0 `tasks/*`, `agent/*`; v1.0 `GetTask`, `ListTasks`, `CancelTask`,
      `*PushNotificationConfig*`, `GetAgentCard`/`GetExtendedAgentCard`, …
-2. **A2A HTTP+JSON (REST) send binding** — recognized by request **path** (final segment
-   `message:send` / `message:stream`), since the body is a bare `SendMessageRequest`, not a JSON-RPC
-   envelope. This binding is a **v1.0-only surface** with a single, version-independent rejection
-   shape (`google.rpc.Status`), so no header or method is consulted for a version — the path match is
-   sufficient.
 
-Anything matching neither path (a batch array, a non-send REST path, a notification, unparsable JSON,
-`application/grpc`) passes through **ungated** (fail-open recognition).
+Outside matched REST send paths, valid batches, non-send REST paths, notifications/no-id calls,
+and exempt methods pass through ungated. `application/grpc` is excluded at headers. Do not call
+these surfaces safe merely because they are exempt: prohibit them wherever the upstream can
+execute or access governed data (including task results) through them.
 
 ### Why A2A rejections are shaped differently from MCP
 
@@ -153,6 +157,9 @@ through two **orthogonal** config knobs — do not conflate them:
   last-known-good score already exists. `true` keeps serving the cached score; `false` treats the
   failure as an unknown score and defers to `blockOnUnknownScore`. It never applies when there is no
   cached score to fall back to.
+- **Lock contention or lock errors:** a stale cached score is served only with
+  `failOpenOnCdgcError=true`; otherwise resolve to unknown and apply `blockOnUnknownScore`.
+- **Total deadline expiry:** resolves to unknown directly; stale recovery is not guaranteed.
 
 ### Denials surface as PolicyViolations
 
@@ -178,15 +185,46 @@ scheduler with its own failure and observability surface. Inline keeps the model
 **bounded, not moved**.
 
 - **Per-call timeout** (`timeout`, default 5000 ms) caps each single CDGC HTTP call.
-- **Overall refresh budget** (`CDGC_REFRESH_BUDGET_MS`, ~10s) caps the *whole* three-call chain: each
-  call's effective timeout is clamped to the budget still remaining (`next_call_timeout`), so total
-  blocking can never exceed the cap. This replaced the previous ~180s worst case (three 60s calls).
-- When the budget is exhausted the refresh **aborts** and the request falls back to the configured
-  unknown-score posture — serve last-known-good under `failOpenOnCdgcError=true`, otherwise apply
-  `blockOnUnknownScore`. The agent's call is never blocked unbounded.
+- **Refresh-chain budget:** each HTTP timeout is clamped to the remaining 10s chain budget.
+- **Total score-resolution deadline:** a PDK Timer with a 10ms tick races the entire resolution
+  against 10s, including cache reads, lock acquisition, HTTP, and storage writes. Expiry returns
+  unknown and applies `blockOnUnknownScore`. Cancelling pending HTTP/storage work cannot undo
+  remote writes or side effects already issued. This is not an upload or end-to-end request timeout.
 
-Time is read via the injected PDK `Clock` (`clock.now()`), never `SystemTime::now()`, so it is
-host-sourced and testable.
+Time is host-sourced through the injected PDK Clock/Timer, not `SystemTime::now()`.
+
+## Security invariants and deployment requirements
+
+- Configuration requires finite thresholds in 0..100 with `blockThreshold <= warnThreshold`,
+  `scoreAggregation` of `min` or `average`, timeout 1..10000ms, refresh interval >=30s, and a
+  nonempty asset id. Fetched dimensions and cached scores must also be finite and in 0..100.
+- Both CDGC services require HTTPS, a nonempty authority, and no userinfo. Set
+  `allowInsecureLocalServices=true` ONLY for local mocks; this flag does not prove a host is local.
+- Remote namespaces bind policy namespace/name/filter metadata; entry keys bind login/API source
+  URLs, account username, asset id, and aggregation mode. Do not include passwords in identities.
+- Writes with older/equal observation-start timestamps are rejected against the observed entry.
+  Gossip is not linearizable, wall-clock skew affects ordering, and simultaneous refreshes remain
+  unresolved across replicas. Never promise a globally unique lock or globally ordered writes.
+- Cache age is observation age, not CDGC scan age. A newly fetched old scan is still old source data.
+- `distributed=true` requires remote configuration. Remote extraction/setup or runtime storage
+  errors must not trigger automatic local fallback; runtime failures use the documented score posture.
+- Authentication/authorization must precede the gate; the direct backend must be unreachable to
+  clients. Every governed route must be bound to the configured fixed asset, not a client-selected
+  asset or tenant that can differ from `cdgcAssetId`.
+- Prohibit alternate transports, non-JSON requests, batches, no-id execution, and task-read/exempt
+  bypasses wherever upstream execution or governed-data access is possible through those surfaces.
+- MUST configure the gateway's 1MiB connection buffer plus upload, idle, and request timeouts.
+  PDK high-level buffering waits for EOF; post-buffer request checks alone do not bound memory or
+  slow uploads. CDGC's 1MiB response limit is likewise post-buffer, not a network-memory bound.
+- Require external egress destination and TLS trust allowlisting; HTTPS validation alone does not
+  establish trusted endpoints or SSRF protection. Verify effective limits for outbound CDGC traffic.
+
+## Release blockers
+
+Do not claim production readiness until the pending dependency advisory scan, real-topology
+buffer/timeout/auth/bypass/isolation verification, TLS/egress verification, and multi-replica
+gossip/concurrency verification are complete. Local mock and unit results do not satisfy them.
+See `docs/spec.md` for the behavioral contract.
 
 ## Resources
 

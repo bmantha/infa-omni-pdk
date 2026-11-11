@@ -16,7 +16,9 @@ invocations are gated:
 - **A2A** message-send invocations — across **both A2A v0.3.0 and v1.0** and both transports:
   - the JSON-RPC send methods: `message/send` / `message/stream` (v0.3.0) and
     `SendMessage` / `SendStreamingMessage` (v1.0);
-  - the A2A HTTP+JSON (REST) send binding (a path ending in `message:send`) — a v1.0-only surface.
+   - the A2A HTTP+JSON (REST) send binding (a final path segment `message:send` or
+     `message:stream`) — a v1.0-only surface. A matching REST path takes precedence over any
+     JSON-RPC-looking body, including an exempt method or missing `id`.
 
 The score decision is identical for both protocols; only the **rejection shape** differs so each
 client sees a protocol-conformant error (see below):
@@ -52,20 +54,33 @@ carries in `data`.
 
 A2A **housekeeping** methods — task management, push-notification config, and agent-card discovery
 (`tasks/*`, `agent/*` in v0.3.0; `GetTask`, `ListTasks`, `*PushNotificationConfig*`, `GetAgentCard`, …
-in v1.0) — touch no asset data and pass through **ungated**, exactly like MCP's handshake/discovery
-methods.
+in v1.0) — pass through **ungated**, exactly like MCP's handshake/discovery methods. This is a
+recognition boundary, not proof that those methods cannot expose governed data. If task reads or
+other exempt methods expose such data, prohibit that bypass before upstream access.
 
 > **gRPC transport:** A2A's optional gRPC binding is a documented pass-through — its
 > `application/grpc` content type is not `application/json`, so the recognition step skips it ungated.
-> Gate A2A agents on their JSON-RPC or REST HTTP surface.
+> Gate A2A agents on their JSON-RPC or REST HTTP surface. Prohibit gRPC and other alternate
+> transports if the upstream can execute or access governed data through them.
 
 ### CDGC / IDMC integration
 
 The DQ score is retrieved from CDGC via a short inline chain — IDMC **Login** → **JWT** → asset
 **detail** — using a service-account credential. Multiple DQ dimensions are combined into one score by
-`scoreAggregation` (`min`, the conservative default, or `average`). The whole chain is bounded by a
-per-call `timeout` and an overall hot-path latency budget, so a slow or failing CDGC never blocks an
-agent call unbounded.
+`scoreAggregation` (`min`, the conservative default, or `average`). Thresholds, fetched dimensions,
+and cached scores must be finite and within **0..100**; `blockThreshold` must not exceed
+`warnThreshold`. Invalid score data is not a trustworthy score.
+
+CDGC services require **HTTPS by default**, with nonempty authorities and no URL userinfo.
+`allowInsecureLocalServices: true` permits HTTP **only for local mock testing**; it does not verify
+that a destination is local. Never enable it in production.
+
+Each HTTP call has a `timeout` (default 5000 ms), clamped to the remaining refresh-chain budget.
+A PDK Timer with a **10 ms tick** also enforces a **10 s total score-resolution deadline**, including
+cache reads, lock acquisition, HTTP calls, and cache writes. Deadline expiry yields an unknown
+score and applies `blockOnUnknownScore`; it does not guarantee stale-cache recovery. Dropping the
+pending work cannot undo remote writes or HTTP side effects already issued. This deadline starts
+after request-body validation, not at upload start.
 
 ### Caching
 
@@ -74,17 +89,59 @@ default 24h — CDGC DQ scans run roughly daily), so the vast majority of reques
 with no CDGC round-trip. Set `distributed: true` to share the cache and refresh lock across gateway
 replicas via gossip-replicated storage; the default keeps per-replica in-memory state.
 
+Remote score and lock namespaces include policy metadata (`policy_namespace`, `policy_name`,
+`filter_name`). Entry keys additionally bind the login/API source URLs, service-account username,
+asset id, and aggregation mode. Writes with an older or equal observation-start timestamp are
+rejected against the currently observed entry. This is **not linearizable**: gossip can admit
+simultaneous refreshes, clock skew affects ordering, and concurrent refresh conflicts remain
+unresolved across replicas. Cache age is time since the policy observed the score, **not the age
+of the CDGC scan**.
+
+If a stale entry exists but a refresh lock is unavailable or fails, it is used only when
+`failOpenOnCdgcError: true`; otherwise the unknown-score posture applies. With `distributed: true`,
+missing remote configuration fails setup. Remote extraction or runtime storage errors do **not**
+automatically switch to a local backend.
+
 ### Safety posture
 
-- **Fail-open recognition:** only genuine MCP tool calls and A2A message-send invocations are gated.
-  Non-POST requests, non-JSON bodies, MCP handshake/discovery methods, A2A housekeeping methods,
-  notifications, JSON-RPC batches, and unrecognized paths pass through ungated, so the policy never
-  breaks non-gated traffic or connection setup.
+- **Early method/MIME exclusion:** non-POST requests and content types other than
+  `application/json` (parameters permitted) pass through before body buffering or score lookup.
+  For JSON POSTs, malformed or over-depth JSON returns **HTTP 400**; a body larger than **1 MiB
+  (1,048,576 bytes)** returns **HTTP 413**, including an early declared-length check.
+- **Limited recognition:** outside matched REST send paths, handshake/discovery, A2A housekeeping,
+  notifications/no-id calls, JSON-RPC batches, and unrecognized paths pass through ungated. They
+  must not become alternate routes to governed execution or data access.
 - **Fail-closed on the unknown:** when no score is available at all (cold start, or a CDGC outage with
   an empty cache), the gate blocks by default (`blockOnUnknownScore: true`). A deliberate soft launch can
   set it `false`; the bypass window is logged once per worker.
 - **No client disclosure by default:** raw scores, thresholds, and the asset id are logged server-side
   only. `discloseScoreDetails: true` opts into surfacing them to the client.
+
+### Required deployment controls
+
+- Place authentication and authorization **before this gate**. The policy is not an authentication
+  control. Make the direct backend unreachable to clients so they cannot route around the gateway.
+- Bind each policy instance's fixed `cdgcAssetId` to every governed operation on that route. Do not
+  let client-selected tools, arguments, tenants, or task ids access a different asset under that score.
+- Prohibit alternate transports, non-JSON requests, batches, no-id invocations, and task-read or
+  exempt-method bypasses wherever the upstream can execute or access governed data through them.
+- **MUST configure a gateway 1 MiB connection buffer**, plus upload, idle, and request timeouts.
+  PDK high-level request buffering waits for EOF before the actual-size check; the policy does not
+  bound slow uploads or buffering by itself. Check the effective settings on the real gateway.
+- Configure **external egress destination allowlisting and TLS trust allowlisting** for both CDGC
+  services. HTTPS scheme validation alone does not prevent SSRF or establish approved trust.
+- CDGC responses have a 1 MiB **post-buffer** size check. This is not a network-memory bound:
+  high-level HTTP responses are already buffered when the policy checks them. Enforce response
+  buffering and timeout controls in the gateway/egress topology as well.
+- Never log credentials, tokens, cookies, authorization headers, raw configuration, or CDGC response
+  bodies. Keep score/asset diagnostics access-controlled even when client disclosure is disabled.
+
+### Release blockers
+
+Production release remains blocked pending the dependency **advisory scan**, real-topology
+verification (buffer limits, timeouts, auth ordering, direct-backend isolation, and bypass closure),
+**TLS/egress trust verification**, and **multi-replica gossip/concurrency verification**. Unit tests
+and local mocks do not establish these deployment guarantees.
 
 Every configurable property is declared in [`definition/gcl.yaml`](definition/gcl.yaml). See
 [`AGENTS.md`](AGENTS.md) for the design rationale and [`playground/`](playground/) for a self-contained

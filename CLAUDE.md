@@ -7,8 +7,9 @@ orientation layer; `dq-gate-policy/CLAUDE.md` / `AGENTS.md` hold the full engine
 - **`dq-gate-policy`** -- gates MCP tool calls / A2A message-send on a CDGC asset's `dataQuality`
   rollup score (`scoreAggregation: min|average`, warn/block thresholds). The reference
   implementation: fail-closed-by-default posture, A2A v0.3/v1.0 (JSON-RPC + REST), `PolicyViolations`
-  telemetry, a 10s budget on the inline CDGC refresh chain, gossip-distributed caching, and
-  `discloseScoreDetails`.
+  telemetry, a Timer-enforced 10s total score-resolution deadline (including storage),
+  gossip-distributed caching, and `discloseScoreDetails`. See `dq-gate-policy/docs/spec.md` for
+  security boundaries and release blockers; do not assume these changes apply to the other gates.
 - **`data-classification-policy`** -- gates the same traffic on the worst-case CDGC
   `core.sensitivity` (LOW=1/MEDIUM=2/HIGH=3) across a list of governed column ids vs.
   `maxAllowedClassification`. Structurally mirrors `dq-gate-policy` (same DataStorage cache/lock

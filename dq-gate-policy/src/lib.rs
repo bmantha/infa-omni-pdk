@@ -5,12 +5,14 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, StoreMode};
-use pdk::hl::timer::Clock;
+use pdk::hl::timer::{Clock, Timer};
+use pdk::metadata::Metadata;
 use pdk::hl::*;
 use pdk::logger;
 use pdk::policy_violation::PolicyViolations;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::generated::config::Config;
 
@@ -87,6 +89,49 @@ const A2A_ERROR_REASON: &str = "DATA_QUALITY_BELOW_THRESHOLD";
 const A2A_ERROR_DOMAIN: &str = "dq-gate.mulesoft.com";
 const HEADER_DQ_SCORE: &str = "x-dq-gate-score";
 const HEADER_DQ_STATUS: &str = "x-dq-gate-status";
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+const MAX_RESPONSE_BYTES: usize = 1_048_576;
+
+fn json_error(stage: &str, err: serde_json::Error) -> anyhow::Error {
+    anyhow!("{stage}: invalid JSON ({:?}, line {}, column {})", err.classify(), err.line(), err.column())
+}
+
+fn valid_score(score: f64) -> bool {
+    score.is_finite() && (0.0..=100.0).contains(&score)
+}
+
+fn parse_config(bytes: &[u8]) -> Result<Config> {
+    let config: Config = serde_json::from_slice(bytes).map_err(|err| json_error("configuration", err))?;
+    if !valid_score(config.block_threshold) || !valid_score(config.warn_threshold)
+        || config.block_threshold > config.warn_threshold
+        || !matches!(config.score_aggregation.as_deref().unwrap_or("min"), "min" | "average")
+        || !(1..=10_000).contains(&config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS))
+        || config.refresh_interval_seconds.unwrap_or(DEFAULT_REFRESH_INTERVAL_SECONDS) < 30
+        || config.cdgc_asset_id.is_empty()
+    {
+        return Err(anyhow!("Invalid DQ gate configuration bounds"));
+    }
+    for service in [&config.cdgc_login_url, &config.cdgc_base_api_url] {
+        let uri = service.uri();
+        if uri.authority().is_empty() || uri.authority().contains('@')
+            || (!uri.scheme().eq_ignore_ascii_case("https")
+                && !(config.allow_insecure_local_services.unwrap_or(false)
+                    && uri.scheme().eq_ignore_ascii_case("http")))
+        {
+            return Err(anyhow!("CDGC services require HTTPS; HTTP is a local-test-only opt-in"));
+        }
+    }
+    Ok(config)
+}
+
+#[pdk::hl::entrypoint_flex]
+fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<()> {
+    let config = parse_config(abi.get_configuration())?;
+    abi.service_create(config.cdgc_base_api_url)?;
+    abi.service_create(config.cdgc_login_url)?;
+    abi.setup()?;
+    Ok(())
+}
 
 /// MCP handshake, discovery, and administrative methods that must always pass through ungated. An
 /// MCP client (e.g. `mcp-remote`) issues `initialize` and `tools/list` just to establish the
@@ -276,11 +321,16 @@ fn nonce_from_time(now: SystemTime) -> String {
 }
 
 fn score_cache_key(config: &Config) -> String {
-    format!("{SCORE_CACHE_KEY_PREFIX}{}", config.cdgc_asset_id)
+    let identity = serde_json::json!([
+        config.cdgc_login_url.uri().to_string(), config.cdgc_base_api_url.uri().to_string(),
+        config.cdgc_org_username, config.cdgc_asset_id,
+        config.score_aggregation.as_deref().unwrap_or("min")
+    ]);
+    format!("{SCORE_CACHE_KEY_PREFIX}{:x}", Sha256::digest(identity.to_string().as_bytes()))
 }
 
 fn refresh_lock_key(config: &Config) -> String {
-    format!("{REFRESH_LOCK_KEY_PREFIX}{}", config.cdgc_asset_id)
+    format!("{REFRESH_LOCK_KEY_PREFIX}{}", score_cache_key(config))
 }
 
 /// TTL (ms) for the remote score namespace. See [`SCORE_STORE_MIN_TTL_MS`]: deliberately long so a
@@ -299,11 +349,11 @@ fn score_store_ttl_ms(config: &Config) -> u32 {
 /// number the policy compares against thresholds. `min` (the conservative default) gates on the
 /// worst dimension; `average` blends them. Returns `None` if CDGC returned no dimensions at all.
 fn aggregate_score(results: &[DqDimensionResult], mode: &str) -> Option<f64> {
-    if results.is_empty() {
+    if results.is_empty() || results.iter().any(|r| !valid_score(r.score)) {
         return None;
     }
     match mode {
-        "average" => Some(results.iter().map(|r| r.score).sum::<f64>() / results.len() as f64),
+        "average" => Some(results.iter().map(|r| r.score / results.len() as f64).sum::<f64>()),
         _ => results.iter().map(|r| r.score).reduce(f64::min),
     }
 }
@@ -578,7 +628,8 @@ fn a2a_rest_block_response(score: Option<f64>, config: &Config) -> Response {
 /// rather than failing the request.
 async fn read_cached_score<S: DataStorage>(store: &S, key: &str) -> Option<CachedScore> {
     match store.get::<CachedScore>(key).await {
-        Ok(Some((cached, _version))) => Some(cached),
+        Ok(Some((cached, _version))) if valid_score(cached.score) && cached.timestamp >= 0 => Some(cached),
+        Ok(Some(_)) => None,
         Ok(None) => None,
         Err(err) => {
             logger::warn!("Failed to read cached DQ score from data storage: {err}");
@@ -591,35 +642,42 @@ async fn read_cached_score<S: DataStorage>(store: &S, key: &str) -> Option<Cache
 /// `StoreMode::Cas` overwrite on an existing entry. Never DELETE-then-insert -- on the remote
 /// (gossip) backend a DELETE tombstone can propagate *after* the new write and destroy it. A CAS
 /// conflict just means another refresher wrote first, so we re-read and retry a bounded number of
-/// times; any hard error is logged and swallowed (the in-flight request already has its score).
-async fn write_cached_score<S: DataStorage>(store: &S, key: &str, cached: &CachedScore) {
+/// times. A newer or equal observation wins and supplies the decision score; hard errors or
+/// exhausted retries return an unknown score rather than trusting an uncommitted observation.
+async fn write_cached_score<S: DataStorage>(store: &S, key: &str, cached: &CachedScore) -> Option<f64> {
     for _ in 0..CAS_MAX_RETRIES {
         match store.get::<CachedScore>(key).await {
-            Ok(Some((_, version))) => match store.store(key, &StoreMode::Cas(version), cached).await {
-                Ok(()) => return,
+            Ok(Some((existing, version))) => {
+                if existing.timestamp >= cached.timestamp {
+                    return valid_score(existing.score).then_some(existing.score);
+                }
+                match store.store(key, &StoreMode::Cas(version), cached).await {
+                Ok(()) => return Some(cached.score),
                 // Retriable: a concurrent writer bumped the version. Re-read and try again.
                 Err(DataStorageError::CasMismatch) => continue,
                 Err(err) => {
                     logger::warn!("Failed to persist refreshed DQ score: {err}");
-                    return;
+                    return None;
+                }
                 }
             },
             Ok(None) => match store.store(key, &StoreMode::Absent, cached).await {
-                Ok(()) => return,
+                Ok(()) => return Some(cached.score),
                 // Retriable: another writer created the entry between our read and write.
                 Err(DataStorageError::CasMismatch) => continue,
                 Err(err) => {
                     logger::warn!("Failed to persist refreshed DQ score: {err}");
-                    return;
+                    return None;
                 }
             },
             Err(err) => {
                 logger::warn!("Failed to read DQ score before persisting refresh: {err}");
-                return;
+                return None;
             }
         }
     }
     logger::warn!("Exhausted CAS retries persisting refreshed DQ score for key '{key}'");
+    None
 }
 
 /// Best-effort single-initiator lock so that when the cached score goes stale under concurrent
@@ -630,8 +688,8 @@ async fn write_cached_score<S: DataStorage>(store: &S, key: &str, cached: &Cache
 ///
 /// Returns:
 /// - `Ok(true)`  -- this request acquired the lock and must perform the refresh.
-/// - `Ok(false)` -- another request holds a still-fresh lock; serve the existing cached value.
-/// - `Err(_)`    -- a hard storage error; the caller decides (we favour freshness and refresh).
+/// - `Ok(false)` -- another request holds a still-fresh lock; apply the stale-score posture.
+/// - `Err(_)`    -- a hard storage error; the caller applies the same stale-score posture.
 ///
 /// On `CasMismatch` (the key already exists) the held lock is classified by age: if older than
 /// [`REFRESH_LOCK_TTL_SECONDS`] the holder is presumed dead and the lock is taken over with a
@@ -680,7 +738,7 @@ async fn try_acquire_refresh_lock<S: DataStorage>(
 /// timeout is clamped (via [`next_call_timeout`]) to the budget still remaining. If the budget is
 /// exhausted before a call, the refresh aborts with an error and the caller applies the
 /// unknown-score fallback -- the request never blocks unbounded (#9).
-async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -> Result<f64> {
+async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Timer) -> Result<f64> {
     let start = clock.now();
     let per_call_ms = config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
 
@@ -708,8 +766,9 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -
         // `logger::warn!`, which is lower-trust than the secret store (see #6 / pdk-policy-logging).
         return Err(anyhow!("CDGC login returned status {}", login_response.status_code()));
     }
+    if login_response.body().len() > MAX_RESPONSE_BYTES { return Err(anyhow!("CDGC Login response exceeds limit")); }
     let login: CdgcLoginResponse = serde_json::from_slice(login_response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC login response: {err}"))?;
+        .map_err(|err| json_error("CDGC Login", err))?;
 
     // Unique per-request nonce (from the injected Clock), percent-encoded into the query. Encoding a
     // purely numeric nonce is a no-op today but guards the query if the derivation ever changes.
@@ -735,8 +794,9 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -
         // Status code only -- the Token endpoint returns JWT material in its body; keep it out of logs.
         return Err(anyhow!("CDGC JWT fetch returned status {}", jwt_response.status_code()));
     }
+    if jwt_response.body().len() > MAX_RESPONSE_BYTES { return Err(anyhow!("CDGC JWT response exceeds limit")); }
     let jwt: CdgcJwtResponse = serde_json::from_slice(jwt_response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC JWT response: {err}"))?;
+        .map_err(|err| json_error("CDGC JWT", err))?;
 
     // Percent-encode the asset id: it is interpolated into the path *segment* before the query, so
     // an id containing `?`, `#`, `/`, or whitespace would otherwise alter the request target.
@@ -766,12 +826,14 @@ async fn fetch_cdgc_score(client: &HttpClient, config: &Config, clock: &Clock) -
         // logs. Not a token endpoint, but the same secret-in-logs anti-pattern (#6).
         return Err(anyhow!("CDGC DQ score fetch returned status {}", detail_response.status_code()));
     }
+    if detail_response.body().len() > MAX_RESPONSE_BYTES { return Err(anyhow!("CDGC Detail response exceeds limit")); }
     let detail: AssetDetailResponse = serde_json::from_slice(detail_response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC asset detail response: {err}"))?;
+        .map_err(|err| json_error("CDGC Detail", err))?;
 
     let mode = config.score_aggregation.as_deref().unwrap_or("min");
     aggregate_score(&detail.data_quality, mode)
-        .ok_or_else(|| anyhow!("CDGC returned no dataQuality dimensions for asset '{}'", config.cdgc_asset_id))
+        .filter(|score| valid_score(*score))
+        .ok_or_else(|| anyhow!("CDGC returned missing or invalid dataQuality scores"))
 }
 
 /// The core lazy/TTL cache-aside logic: read the cached score from PDK-native [`DataStorage`], and
@@ -783,7 +845,7 @@ async fn resolve_score<S: DataStorage>(
     config: &Config,
     score_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
 ) -> Option<f64> {
     let key = score_cache_key(config);
     let refresh_interval = config
@@ -794,14 +856,11 @@ async fn resolve_score<S: DataStorage>(
 
     let cached = read_cached_score(score_store, &key).await;
 
-    // Read wall-clock time through the injected PDK `Clock`, never `SystemTime::now()`: proxy-wasm
-    // policies must source time from the host so it is testable and consistent with the runtime's
-    // clock (see the `pdk-timer` guidance). No `Timer` is built -- this policy has no periodic task,
-    // and `Clock::now()` is the sanctioned way to read the current time without setting a host tick
-    // period that would otherwise fire unconsumed wakeups.
+    // Read host time through the Timer built from the injected Clock. Its ticks also wake the
+    // total-resolution deadline while storage or HTTP work is pending; no background refresh runs.
     let now = unix_seconds(clock.now());
     let is_stale = match &cached {
-        Some(cached) => now - cached.timestamp > refresh_interval,
+        Some(cached) => now < cached.timestamp || now.saturating_sub(cached.timestamp) > refresh_interval,
         None => true,
     };
 
@@ -820,8 +879,8 @@ async fn resolve_score<S: DataStorage>(
     let lock_acquired = match try_acquire_refresh_lock(lock_store, &lock_key, now).await {
         Ok(acquired) => acquired,
         Err(err) => {
-            logger::warn!("Failed to acquire DQ score refresh lock: {err}; proceeding with refresh");
-            true
+            logger::warn!("Failed to acquire DQ score refresh lock: {err}");
+            false
         }
     };
     if !lock_acquired {
@@ -829,7 +888,7 @@ async fn resolve_score<S: DataStorage>(
             "DQ score refresh for asset '{}' already in progress elsewhere; serving existing cached value",
             config.cdgc_asset_id
         );
-        return cached.map(|cached| cached.score);
+        return if fail_open { cached.map(|cached| cached.score) } else { None };
     }
 
     match fetch_cdgc_score(client, config, clock).await {
@@ -838,9 +897,9 @@ async fn resolve_score<S: DataStorage>(
                 "Fetched fresh DQ score from CDGC for asset '{}': {score:.2}",
                 config.cdgc_asset_id
             );
+            // Order by observation start, not completion: a delayed old read must not win.
             let fresh = CachedScore { score, timestamp: now };
-            write_cached_score(score_store, &key, &fresh).await;
-            Some(score)
+            write_cached_score(score_store, &key, &fresh).await
         }
         Err(err) => {
             logger::warn!("CDGC DQ score refresh failed for asset '{}': {err}", config.cdgc_asset_id);
@@ -867,7 +926,7 @@ async fn request_filter<S: DataStorage>(
     client: &HttpClient,
     score_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
     violations: &PolicyViolations,
 ) -> Flow<DqGateData> {
     // Atomically buffer request headers AND body before deciding. The split
@@ -877,7 +936,7 @@ async fn request_filter<S: DataStorage>(
     // response could race our synthetic Flow::Break. The combined state holds the request in the
     // filter until we decide, so Flow::Break always wins (see #2). The known response-leg hang
     // with this combined state does not apply here -- this is the request leg.
-    let state = request_state.into_headers_body_state().await;
+    let headers = request_state.into_headers_state().await;
 
     // Fail-open recognition (pdk-mcp / A2A contract): only gate genuine *invocation* traffic on the
     // two protocols this policy governs -- MCP and A2A (Agent2Agent). Anything that is not a POST of
@@ -886,17 +945,24 @@ async fn request_filter<S: DataStorage>(
     // pass-through), unparsable JSON, or a batch array -- passes straight through ungated, so the
     // policy never breaks non-MCP/A2A traffic or connection establishment. This is the opposite of
     // failing closed on anything it does not understand.
-    let request_method = state.handler().header(":method").unwrap_or_default();
+    let request_method = headers.handler().header(":method").unwrap_or_default();
     if !request_method.eq_ignore_ascii_case("POST") {
         logger::debug!("Non-POST request ('{request_method}'); passing through ungated");
         return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
     }
-    let content_type = state.handler().header("content-type").unwrap_or_default();
-    if !content_type.to_ascii_lowercase().contains("application/json") {
+    let content_type = headers.handler().header("content-type").unwrap_or_default();
+    if !content_type.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("application/json") {
         logger::debug!("Non-JSON content-type ('{content_type}'); passing through ungated");
         return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
     }
 
+    if headers.handler().header("content-length").and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|size| size > MAX_REQUEST_BYTES)
+    {
+        violations.generate_policy_violation();
+        return Flow::Break(Response::new(413).with_body("Request exceeds DQ gate size limit"));
+    }
+    let state = headers.into_headers_body_state().await;
     let body = if state.contains_body() {
         state.handler().body()
     } else {
@@ -912,7 +978,18 @@ async fn request_filter<S: DataStorage>(
     //      (its body is a bare SendMessageRequest, not a JSON-RPC envelope). This is A2A's v1.0 REST
     //      surface, answered with a `google.rpc.Status` body (pdk-a2a Shape 3).
     // Anything matching neither passes through ungated (fail-open).
-    let (protocol, rpc_id) = match parse_jsonrpc_call(&body) {
+    if body.is_empty() && !a2a_rest_send_path(&state.handler().header(":path").unwrap_or_default()) {
+        return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
+    }
+    if body.len() > MAX_REQUEST_BYTES || serde_json::from_slice::<Value>(&body).is_err() {
+        violations.generate_policy_violation();
+        return Flow::Break(Response::new(if body.len() > MAX_REQUEST_BYTES { 413 } else { 400 })
+            .with_body("Request exceeds DQ gate JSON limits or is malformed"));
+    }
+    let path = state.handler().header(":path").unwrap_or_default();
+    let (protocol, rpc_id) = if a2a_rest_send_path(&path) {
+        (GateProtocol::A2a(A2aBinding::Rest), None)
+    } else { match parse_jsonrpc_call(&body) {
         Some((method, rpc_id)) => {
             // A notification (a `notifications/*` method, or any call without an `id`) may NEVER
             // receive a response per JSON-RPC 2.0, so it can't be answered with a block -- pass it on.
@@ -949,9 +1026,17 @@ async fn request_filter<S: DataStorage>(
                 return Flow::Continue(DqGateData::Evaluated { score: None, status: "skipped" });
             }
         }
-    };
+    }};
 
-    let score = resolve_score(client, config, score_store, lock_store, clock).await;
+    let work = Box::pin(resolve_score(client, config, score_store, lock_store, clock));
+    let deadline = Box::pin(clock.sleep(Duration::from_millis(CDGC_REFRESH_BUDGET_MS as u64)));
+    let score = match futures::future::select(work, deadline).await {
+        futures::future::Either::Left((score, _)) => score,
+        futures::future::Either::Right((_, _)) => {
+            logger::warn!("DQ score resolution exceeded total latency budget");
+            None
+        }
+    };
 
     // Only surface the raw numeric score to the client (via the x-dq-gate-score header on an
     // allowed response) when explicitly opted in; the coarse status header is always emitted. See
@@ -1023,6 +1108,10 @@ async fn response_filter(response_state: ResponseState, request_data: RequestDat
     let headers_state = response_state.into_headers_state().await;
 
     if let RequestData::Continue(DqGateData::Evaluated { score, status }) = request_data {
+        let retained = headers_state.handler().headers().into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(HEADER_DQ_SCORE) && !name.eq_ignore_ascii_case(HEADER_DQ_STATUS))
+            .collect::<Vec<_>>();
+        headers_state.handler().set_headers(retained.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect());
         if let Some(score) = score {
             headers_state.handler().set_header(HEADER_DQ_SCORE, &format!("{score:.2}"));
         }
@@ -1039,7 +1128,7 @@ async fn launch_policy<S: DataStorage>(
     client: &HttpClient,
     score_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
     violations: &PolicyViolations,
 ) -> Result<()> {
     let filter = on_request(|rs| {
@@ -1058,22 +1147,31 @@ async fn configure(
     storage_builder: DataStorageBuilder,
     clock: Clock,
     violations: PolicyViolations,
+    metadata: Metadata,
+    remote_client: Option<pdk_data_storage_lib::ll::distributed::DistributedStorageClient>,
 ) -> Result<()> {
-    let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
-        anyhow!(
-            "Failed to parse configuration '{}'. Cause: {}",
-            String::from_utf8_lossy(&bytes),
-            err
-        )
-    })?;
+    let config = parse_config(&bytes)?;
+    let clock = clock.period(Duration::from_millis(10));
 
     // `distributed=true` shares the score cache and refresh lock across gateway replicas via the
     // gossip-replicated remote backend (requires shared storage configured on the gateway);
     // `false` (default) keeps them per-replica in memory. Downstream logic is identical either
     // way -- see `launch_policy`.
     if config.distributed.unwrap_or(false) {
-        let score_store = storage_builder.remote(SCORE_CACHE_NAMESPACE, score_store_ttl_ms(&config));
-        let lock_store = storage_builder.remote(REFRESH_LOCK_NAMESPACE, REFRESH_LOCK_TTL_MS);
+        let gateway_config: Value = serde_json::from_slice(&bytes).map_err(|err| json_error("configuration", err))?;
+        let coordinates = gateway_config.get("sharedStorage");
+        if coordinates.and_then(|s| s.get("baseUrl")).and_then(Value::as_str).is_none_or(str::is_empty)
+            || coordinates.and_then(|s| s.get("service")).and_then(Value::as_str).is_none_or(str::is_empty)
+        { return Err(anyhow!("Distributed storage requires gateway sharedStorage coordinates")); }
+        if remote_client.is_none() { return Err(anyhow!("Distributed storage configuration is unavailable")); }
+        let identity = format!("{:x}", Sha256::digest(serde_json::json!([
+            metadata.policy_metadata.policy_namespace, metadata.policy_metadata.policy_name,
+            metadata.policy_metadata.filter_name
+        ]).to_string().as_bytes()));
+        let score_namespace = format!("{SCORE_CACHE_NAMESPACE}-{identity}");
+        let lock_namespace = format!("{REFRESH_LOCK_NAMESPACE}-{identity}");
+        let score_store = storage_builder.remote(&score_namespace, score_store_ttl_ms(&config));
+        let lock_store = storage_builder.remote(&lock_namespace, REFRESH_LOCK_TTL_MS);
         launch_policy(launcher, &config, &client, &score_store, &lock_store, &clock, &violations).await
     } else {
         let score_store = storage_builder.local(SCORE_CACHE_NAMESPACE);
@@ -1093,13 +1191,14 @@ mod test {
     use pdk::data_storage::{DataStorage, DataStorageError, StoreMode};
     use pdk_unit::{TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
     use serde::{de::DeserializeOwned, Serialize};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{CachedScore, REFRESH_LOCK_TTL_SECONDS};
 
     fn config() -> String {
         json!({
             "cdgcLoginUrl": "http://cdgclogin",
+            "allowInsecureLocalServices": true,
             "cdgcBaseApiUrl": "http://cdgcapi",
             "cdgcOrgUsername": "test-user",
             "cdgcOrgPassword": "test-pass",
@@ -2373,7 +2472,7 @@ mod test {
     /// What the double's `store` should do on each call.
     #[derive(Clone, Copy)]
     enum FakeStore {
-        /// A hard (non-retriable) storage error -- must be logged and swallowed, no retry.
+        /// A hard (non-retriable) storage error -- returns unknown without retrying.
         Fail,
         /// A CAS conflict -- retriable, so the caller loops until `CAS_MAX_RETRIES` is exhausted.
         Cas,
@@ -2458,41 +2557,41 @@ mod test {
     }
 
     #[test]
-    fn write_cached_score_swallows_hard_error_on_cas_overwrite() {
-        // Existing entry -> CAS overwrite path. A hard (non-CasMismatch) store error must be
-        // logged and swallowed WITHOUT retrying: exactly one store attempt, and no panic.
+    fn write_cached_score_returns_unknown_on_cas_overwrite_error() {
+        // Existing entry -> CAS overwrite path. A hard (non-CasMismatch) store error must
+        // return unknown WITHOUT retrying: exactly one store attempt, and no panic.
         let store = FailingDataStorage::new(FakeGet::Hit(7), FakeStore::Fail);
-        block_on(super::write_cached_score(
+        assert_eq!(block_on(super::write_cached_score(
             &store,
             "dq-score-asset-cas-hard",
             &CachedScore { score: 88.0, timestamp: 100 },
-        ));
+        )), None);
         assert_eq!(store.store_calls(), 1, "hard CAS error must not be retried");
     }
 
     #[test]
-    fn write_cached_score_swallows_hard_error_on_absent_insert() {
-        // Cache miss -> Absent put-if-absent path. A hard (non-CasMismatch) store error must be
-        // logged and swallowed WITHOUT retrying: exactly one store attempt, and no panic.
+    fn write_cached_score_returns_unknown_on_absent_insert_error() {
+        // Cache miss -> Absent put-if-absent path. A hard (non-CasMismatch) store error must
+        // return unknown WITHOUT retrying: exactly one store attempt, and no panic.
         let store = FailingDataStorage::new(FakeGet::Miss, FakeStore::Fail);
-        block_on(super::write_cached_score(
+        assert_eq!(block_on(super::write_cached_score(
             &store,
             "dq-score-asset-absent-hard",
             &CachedScore { score: 88.0, timestamp: 100 },
-        ));
+        )), None);
         assert_eq!(store.store_calls(), 1, "hard Absent-insert error must not be retried");
     }
 
     #[test]
-    fn write_cached_score_swallows_read_before_persist_error() {
+    fn write_cached_score_returns_unknown_on_read_before_persist_error() {
         // A hard error on the read-before-write must abort the persist (log + return) BEFORE any
         // store attempt -- so store is never called and nothing panics.
         let store = FailingDataStorage::new(FakeGet::Fail, FakeStore::Ok);
-        block_on(super::write_cached_score(
+        assert_eq!(block_on(super::write_cached_score(
             &store,
             "dq-score-asset-read-err",
             &CachedScore { score: 88.0, timestamp: 100 },
-        ));
+        )), None);
         assert_eq!(store.store_calls(), 0, "a read error must abort before persisting");
     }
 
@@ -2502,11 +2601,11 @@ mod test {
         // loop must retry exactly CAS_MAX_RETRIES times before giving up (final warn), not spin
         // forever and not bail after one attempt.
         let store = FailingDataStorage::new(FakeGet::Hit(7), FakeStore::Cas);
-        block_on(super::write_cached_score(
+        assert_eq!(block_on(super::write_cached_score(
             &store,
             "dq-score-asset-cas-loop",
             &CachedScore { score: 88.0, timestamp: 100 },
-        ));
+        )), None);
         assert_eq!(store.store_calls(), super::CAS_MAX_RETRIES, "CAS conflict must retry the full bound");
     }
 
@@ -2515,11 +2614,11 @@ mod test {
         // Cache miss + a perpetual Absent-insert conflict (another writer keeps winning the race):
         // retriable, so the loop must retry exactly CAS_MAX_RETRIES times before giving up.
         let store = FailingDataStorage::new(FakeGet::Miss, FakeStore::Cas);
-        block_on(super::write_cached_score(
+        assert_eq!(block_on(super::write_cached_score(
             &store,
             "dq-score-asset-absent-loop",
             &CachedScore { score: 88.0, timestamp: 100 },
-        ));
+        )), None);
         assert_eq!(store.store_calls(), super::CAS_MAX_RETRIES, "Absent conflict must retry the full bound");
     }
 
@@ -2622,7 +2721,7 @@ mod test {
     fn refresh_lock_stale_takeover_hard_error_propagates() {
         // As above, but the CAS-overwrite of the stale lock fails with a hard (non-CasMismatch)
         // storage error. `try_acquire_refresh_lock` must propagate the error to the caller rather
-        // than silently deny or grant -- resolve_score then decides (it favours freshness).
+        // than silently deny or grant -- resolve_score applies the configured stale-score posture.
         let stale = serde_json::to_vec(&super::RefreshLock { acquired_at: 0 }).unwrap();
         let store = ScriptedStore::new(
             vec![
@@ -2711,51 +2810,23 @@ mod test {
     // --- entrypoint-driven coverage: resolve_score contention, CDGC HTTP errors, config arms ---
 
     #[test]
-    fn stale_cache_served_without_cdgc_when_refresh_lock_still_fresh() {
-        // resolve_score contention arm: when the cached score has gone stale but a *fresh* refresh
-        // lock is still held (another request is presumed mid-refresh), this request must serve the
-        // existing cached score WITHOUT paying for its own CDGC round-trip. Distinct from the
-        // stale-refresh tests, which sleep past the 30s lock TTL so the lock is instead taken over
-        // and re-fetched.
+    fn invalid_refresh_interval_is_rejected() {
+        // Intervals below the 30s lock lifetime are rejected during configuration, before any
+        // request can fetch a score or reach the backend.
         let login_calls = Rc::new(RefCell::new(0));
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
         let mut tester = UnitTestBuilder::default()
-            // refreshIntervalSeconds=1 makes the cache go stale almost immediately, while the
-            // refresh lock's fixed 30s TTL keeps the just-acquired lock fresh -- the exact window
-            // the stampede guard must serve-cached rather than re-fetch.
             .with_config(config_with(json!({ "refreshIntervalSeconds": 1 })))
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
             .with_entrypoint(super::configure);
 
-        // Request 1 (t=0): cold cache -> acquires the lock, fetches 95.0 from CDGC, caches it.
-        let first = tester.request(mcp_request(1));
-        assert_eq!(first.header("x-dq-gate-status"), Some("ok"));
-        assert_eq!(*login_calls.borrow(), 1, "the first request must perform the CDGC login");
-        assert!(backend.next().is_some());
-
-        // Advance 5s: past refreshIntervalSeconds (1) so the cache is stale, but well within the
-        // 30s refresh-lock TTL so the lock acquired at t=0 is still fresh and held.
-        tester.sleep(Duration::from_secs(5));
-
-        // Request 2 (t=5): cache stale, but the fresh lock denies acquisition -> serve the cached
-        // 95.0 and DO NOT re-authenticate against CDGC.
-        let second = tester.request(mcp_request(2));
-        assert_eq!(second.status_code(), 200);
-        assert_eq!(
-            second.header("x-dq-gate-status"),
-            Some("ok"),
-            "the still-cached score must be served during refresh contention"
-        );
-        assert!(second.body().is_empty(), "a served-cached pass-through carries no error body");
-        assert!(backend.next().is_some(), "the contended request must still forward to the MCP backend");
-        assert_eq!(
-            *login_calls.borrow(),
-            1,
-            "serving the cached score during contention must NOT trigger a second CDGC fetch"
-        );
+        assert!(super::parse_config(config_with(json!({"refreshIntervalSeconds": 1})).as_bytes()).is_err());
+        let _response = tester.request(mcp_request(1));
+        assert_eq!(*login_calls.borrow(), 0);
+        assert!(backend.next().is_none());
     }
 
     #[test]
@@ -2920,7 +2991,9 @@ mod test {
         let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(json!({ "distributed": true })))
+            .with_config(config_with(json!({ "distributed": true,
+                "sharedStorage": {"baseUrl": "http://127.0.0.1:4000", "service": "x-flex-keyvalue-store"}
+            })))
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
             .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
@@ -2991,5 +3064,354 @@ mod test {
         assert!(second.body().is_empty(), "a soft-launch pass-through must not carry an error body");
         assert!(backend.next().is_some(), "second soft-launch request must also reach the backend");
         assert!(second.violation().is_none(), "an ungated pass-through must not emit a violation");
+    }
+
+    #[test]
+    fn strict_failure_retry_stays_blocked() {
+        let backend = Rc::new(TraceBackend::new(|_: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let login_calls = Rc::new(RefCell::new(0));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({ "failOpenOnCdgcError": false })))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_once_then_error(95.0, Rc::new(RefCell::new(0))))
+            .with_entrypoint(super::configure);
+        assert_eq!(tester.request(mcp_request(1)).header("x-dq-gate-status"), Some("ok"));
+        assert!(backend.next().is_some());
+        tester.sleep(Duration::from_secs(86_401));
+        assert_eq!(tester.request(mcp_request(2)).header("x-dq-gate-status"), Some("blocked"));
+        assert!(backend.next().is_none());
+        // The failed refresh leaves a fresh lock and a stale passing score. Strict contention
+        // must remain unknown/blocked instead of resurrecting that cached score on retry.
+        assert_eq!(tester.request(mcp_request(3)).header("x-dq-gate-status"), Some("blocked"));
+        assert!(backend.next().is_none());
+        assert_eq!(*login_calls.borrow(), 2, "contending retry must not start another refresh");
+    }
+
+    #[test]
+    fn rest_envelope_camouflage_is_gated() {
+        let backend = Rc::new(TraceBackend::new(|_: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let calls = Rc::new(RefCell::new(0));
+        let mut tester = recognition_tester(Rc::clone(&calls), Rc::clone(&backend));
+        let request = UnitHttpRequest::post()
+            .with_path("/message:send")
+            .with_header("content-type", "application/json")
+            .with_body(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "ping",
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "text": "run" }] }
+            }).to_string());
+        assert_eq!(tester.request(request).header("x-dq-gate-status"), Some("blocked"));
+        assert!(backend.next().is_none());
+        assert_eq!(*calls.borrow(), 1);
+    }
+
+    #[test]
+    fn deep_json_is_rejected_before_backend() {
+        let backend = Rc::new(TraceBackend::new(|_: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let calls = Rc::new(RefCell::new(0));
+        let mut tester = recognition_tester(Rc::clone(&calls), Rc::clone(&backend));
+        let nested = format!("{}0{}", "[".repeat(140), "]".repeat(140));
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read","arguments":{{"nested":{nested}}}}}}}"#);
+        let request = UnitHttpRequest::post().with_path("/mcp")
+            .with_header("content-type", "application/json").with_body(body);
+        assert_eq!(tester.request(request).status_code(), 400);
+        assert!(backend.next().is_none());
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn invalid_high_score_is_unknown_and_blocked() {
+        let backend = Rc::new(TraceBackend::new(|_: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default().with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(150.0))
+            .with_entrypoint(super::configure);
+        assert_eq!(tester.request(mcp_request(1)).header("x-dq-gate-status"), Some("blocked"));
+        assert!(backend.next().is_none());
+        let dimensions = [super::DqDimensionResult { score: 1e308 }, super::DqDimensionResult { score: 1e308 }];
+        assert!(super::aggregate_score(&dimensions, "average").is_none());
+    }
+
+    #[test]
+    fn upstream_score_header_removed_when_disclosure_off() {
+        let backend = Rc::new(TraceBackend::new(|_: UnitHttpRequest| {
+            UnitHttpResponse::new(200).with_header("x-dq-gate-score", "upstream-value")
+        }));
+        let mut tester = UnitTestBuilder::default().with_config(config())
+            .with_backend(backend)
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::new(RefCell::new(0))))
+            .with_http_upstream_from_authority("cdgcapi", cdgc_score_backend(95.0))
+            .with_entrypoint(super::configure);
+        assert_eq!(tester.request(mcp_request(1)).header("x-dq-gate-score"), None);
+    }
+
+    #[test]
+    fn json_error_omits_response_content() {
+        let body = br#"{"dataQuality":[{"core.score":"DUMMY_SENSITIVE_MARKER"}]}"#;
+        let err = match serde_json::from_slice::<super::AssetDetailResponse>(body) {
+            Ok(_) => panic!("expected a type error"),
+            Err(err) => super::json_error("CDGC Detail", err).to_string(),
+        };
+        assert!(!err.contains("DUMMY_SENSITIVE_MARKER"));
+    }
+
+    #[test]
+    fn parse_config_errors_omit_credentials_and_malicious_field_values() {
+        for invalid in [
+            json!({ "warnThreshold": "INVALID_FIELD_MARKER" }),
+            json!({ "timeout": { "INVALID_FIELD_MARKER": "USERNAME_MARKER PASSWORD_MARKER" } }),
+            json!({ "blockThreshold": 101 }),
+        ] {
+            let mut input: Value = serde_json::from_str(&config_with(invalid)).unwrap();
+            input["cdgcOrgUsername"] = json!("USERNAME_MARKER");
+            input["cdgcOrgPassword"] = json!("PASSWORD_MARKER");
+            let err = match super::parse_config(input.to_string().as_bytes()) {
+                Ok(_) => panic!("invalid configuration accepted"),
+                Err(err) => format!("{err:#}"),
+            };
+            for marker in ["USERNAME_MARKER", "PASSWORD_MARKER", "INVALID_FIELD_MARKER"] {
+                assert!(!err.contains(marker), "configuration error leaked {marker}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_config_requires_https_unless_local_http_is_opted_in() {
+        let mut input: Value = serde_json::from_str(&config()).unwrap();
+        input.as_object_mut().unwrap().remove("allowInsecureLocalServices");
+        assert!(super::parse_config(input.to_string().as_bytes()).is_err());
+        input["allowInsecureLocalServices"] = json!(false);
+        assert!(super::parse_config(input.to_string().as_bytes()).is_err());
+        input["allowInsecureLocalServices"] = json!(true);
+        assert!(super::parse_config(input.to_string().as_bytes()).is_ok());
+        input.as_object_mut().unwrap().remove("allowInsecureLocalServices");
+        input["cdgcLoginUrl"] = json!("https://cdgclogin");
+        input["cdgcBaseApiUrl"] = json!("https://cdgcapi");
+        assert!(super::parse_config(input.to_string().as_bytes()).is_ok());
+        for field in ["cdgcLoginUrl", "cdgcBaseApiUrl"] {
+            let mut mixed = input.clone();
+            mixed[field] = json!("http://localhost:8080");
+            assert!(super::parse_config(mixed.to_string().as_bytes()).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn parse_config_rejects_invalid_threshold_ranges_and_order() {
+        for overrides in [
+            json!({ "blockThreshold": -1 }),
+            json!({ "blockThreshold": 101 }),
+            json!({ "warnThreshold": -1 }),
+            json!({ "warnThreshold": 101 }),
+            json!({ "blockThreshold": 91, "warnThreshold": 90 }),
+        ] {
+            assert!(super::parse_config(config_with(overrides.clone()).as_bytes()).is_err(), "{overrides}");
+        }
+        assert!(super::parse_config(config_with(json!({ "blockThreshold": 0, "warnThreshold": 100 })).as_bytes()).is_ok());
+        assert!(super::parse_config(config_with(json!({ "blockThreshold": 80, "warnThreshold": 80 })).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cache_keys_are_opaque_and_isolate_source_account_asset_and_aggregation() {
+        let base = parsed_config(json!({}));
+        let key = super::score_cache_key(&base);
+        let lock = super::refresh_lock_key(&base);
+        let digest = key.strip_prefix(super::SCORE_CACHE_KEY_PREFIX).unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for marker in ["cdgclogin", "cdgcapi", "test-user", "test-pass", "asset-1"] {
+            assert!(!key.contains(marker));
+            assert!(!lock.contains(marker));
+        }
+        for overrides in [
+            json!({ "scoreAggregation": "average" }),
+            json!({ "cdgcLoginUrl": "http://another-login" }),
+            json!({ "cdgcBaseApiUrl": "http://another-api" }),
+            json!({ "cdgcOrgUsername": "another-account" }),
+            json!({ "cdgcAssetId": "another-asset" }),
+        ] {
+            let other = parsed_config(overrides.clone());
+            assert_ne!(super::score_cache_key(&other), key, "{overrides}");
+            assert_ne!(super::refresh_lock_key(&other), lock, "{overrides}");
+        }
+        assert_eq!(super::score_cache_key(&parsed_config(json!({ "scoreAggregation": "min" }))), key);
+    }
+
+    #[test]
+    fn cached_invalid_scores_and_timestamps_are_unknown() {
+        let store = MockDataStorage::new();
+        for cached in [
+            json!({ "score": -1, "timestamp": 10 }),
+            json!({ "score": 101, "timestamp": 10 }),
+            json!({ "score": 95, "timestamp": -1 }),
+            json!({ "score": null, "timestamp": 10 }),
+            json!({ "score": "NaN", "timestamp": 10 }),
+        ] {
+            block_on(store.store("invalid", &StoreMode::Always, &cached)).unwrap();
+            assert!(block_on(super::read_cached_score(&store, "invalid")).is_none(), "{cached}");
+        }
+        for score in [0.0, 100.0] {
+            block_on(store.store("valid", &StoreMode::Always, &CachedScore { score, timestamp: 0 })).unwrap();
+            assert_eq!(block_on(super::read_cached_score(&store, "valid")).unwrap().score, score);
+        }
+    }
+
+    #[test]
+    fn older_or_equal_observations_cannot_overwrite_blocking_winner() {
+        let store = MockDataStorage::new();
+        let winner = CachedScore { score: 50.0, timestamp: 100 };
+        block_on(store.store("score", &StoreMode::Absent, &winner)).unwrap();
+        for timestamp in [99, 100] {
+            assert_eq!(block_on(super::write_cached_score(
+                &store, "score", &CachedScore { score: 95.0, timestamp },
+            )), Some(50.0));
+            let (cached, version) = block_on(store.get::<CachedScore>("score")).unwrap().unwrap();
+            assert_eq!(cached.score, 50.0);
+            assert_eq!(cached.timestamp, 100);
+            assert_eq!(version, "1", "losing observations must not write at all");
+        }
+    }
+
+    #[test]
+    fn cas_conflict_returns_newer_blocking_winner_not_local_passing_score() {
+        let store = ScriptedStore::new(
+            vec![Err(DataStorageError::CasMismatch)],
+            vec![
+                Ok(Some(serde_json::to_vec(&CachedScore { score: 95.0, timestamp: 1 }).unwrap())),
+                Ok(Some(serde_json::to_vec(&CachedScore { score: 50.0, timestamp: 101 }).unwrap())),
+            ],
+        );
+        assert_eq!(block_on(super::write_cached_score(
+            &store, "score", &CachedScore { score: 95.0, timestamp: 100 },
+        )), Some(50.0));
+        assert!(store.store_results.borrow().is_empty());
+        assert!(store.get_results.borrow().is_empty());
+    }
+
+    #[test]
+    fn newer_invalid_cached_winner_returns_unknown_without_overwrite() {
+        let store = MockDataStorage::new();
+        block_on(store.store("score", &StoreMode::Absent, &CachedScore { score: 150.0, timestamp: 101 })).unwrap();
+        assert_eq!(block_on(super::write_cached_score(
+            &store, "score", &CachedScore { score: 95.0, timestamp: 100 },
+        )), None);
+        assert_eq!(block_on(store.get::<CachedScore>("score")).unwrap().unwrap().1, "1");
+    }
+
+    #[test]
+    fn oversized_actual_body_is_rejected_without_cdgc_or_backend() {
+        let calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&calls), Rc::clone(&backend));
+        // Valid JSON with no oversized declaration: only the actual body-length guard can reject.
+        let request = mcp_request(1).with_body(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "arguments": { "padding": "x".repeat(super::MAX_REQUEST_BYTES) } }
+        }).to_string()).with_header("content-length", "1");
+        let response = tester.request(request);
+        assert_eq!(response.status_code(), 413);
+        assert!(response.violation().is_some());
+        assert!(backend.next().is_none());
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn oversized_declared_body_is_rejected_without_cdgc_or_backend() {
+        let calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+        let mut tester = recognition_tester(Rc::clone(&calls), Rc::clone(&backend));
+        let response = tester.request(mcp_request(1)
+            .with_header("content-length", (super::MAX_REQUEST_BYTES + 1).to_string()));
+        assert_eq!(response.status_code(), 413);
+        assert!(response.violation().is_some());
+        assert!(backend.next().is_none());
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    #[test]
+    fn distributed_missing_coordinates_rejects_configuration_without_backend() {
+        for coordinates in [
+            Value::Null,
+            json!({}),
+            json!({ "baseUrl": "http://127.0.0.1:4000" }),
+            json!({ "service": "x-flex-keyvalue-store" }),
+            json!({ "baseUrl": "", "service": "x-flex-keyvalue-store" }),
+            json!({ "baseUrl": "http://127.0.0.1:4000", "service": "" }),
+        ] {
+            let calls = Rc::new(RefCell::new(0));
+            let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+            let mut input: Value = serde_json::from_str(&config_with(json!({ "distributed": true }))).unwrap();
+            if !coordinates.is_null() { input["sharedStorage"] = coordinates; }
+            let mut tester = UnitTestBuilder::default().with_config(input.to_string())
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&calls)))
+                .with_entrypoint(super::configure);
+            assert_eq!(tester.request(mcp_request(1)).status_code(), 503,
+                "missing coordinates must leave the entrypoint in its configuration-error state");
+            assert!(backend.next().is_none());
+            assert_eq!(*calls.borrow(), 0);
+        }
+    }
+
+    struct PendingDataStorage {
+        pending_write: bool,
+    }
+
+    impl DataStorage for PendingDataStorage {
+        async fn get_keys(&self) -> Result<Vec<String>, DataStorageError> { Ok(Vec::new()) }
+        async fn store<T: Serialize>(&self, _: &str, _: &StoreMode, _: &T) -> Result<(), DataStorageError> {
+            std::future::pending().await
+        }
+        async fn get<T: DeserializeOwned>(&self, _: &str) -> Result<Option<(T, String)>, DataStorageError> {
+            if self.pending_write { Ok(None) } else { std::future::pending().await }
+        }
+        async fn delete(&self, _: &str) -> Result<(), DataStorageError> { Ok(()) }
+        async fn delete_all(&self) -> Result<(), DataStorageError> { Ok(()) }
+    }
+
+    async fn configure_pending_storage(
+        launcher: pdk::hl::Launcher,
+        pdk::hl::Configuration(bytes): pdk::hl::Configuration,
+        client: pdk::hl::HttpClient,
+        clock: pdk::hl::timer::Clock,
+        violations: pdk::policy_violation::PolicyViolations,
+    ) -> anyhow::Result<()> {
+        let config = super::parse_config(&bytes)?;
+        let input: Value = serde_json::from_slice(&bytes)?;
+        let store = PendingDataStorage { pending_write: input["pendingWrite"].as_bool().unwrap_or(false) };
+        let timer = clock.period(Duration::from_millis(10));
+        super::launch_policy(launcher, &config, &client, &store, &store, &timer, &violations).await
+    }
+
+    #[test]
+    fn total_deadline_blocks_pending_cache_read_or_lock_write() {
+        use std::task::Poll;
+
+        for pending_write in [false, true] {
+            let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+            let calls = Rc::new(RefCell::new(0));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config_with(json!({ "pendingWrite": pending_write })))
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&calls)))
+                .with_entrypoint(configure_pending_storage);
+            let mut request = tester.request_partial(mcp_request(42));
+            assert!(matches!(request.poll(), Poll::Pending));
+            tester.sleep(Duration::from_millis(super::CDGC_REFRESH_BUDGET_MS as u64 - 10));
+            assert!(matches!(request.poll(), Poll::Pending), "must wait until the deadline");
+            tester.sleep(Duration::from_millis(20));
+            let response = match request.poll() {
+                Poll::Ready(response) => response,
+                Poll::Pending => panic!("storage must not keep resolution pending past the deadline"),
+            };
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("x-dq-gate-status"), Some("blocked"));
+            let body: Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body["id"], 42);
+            assert_eq!(body["error"]["code"], super::JSONRPC_BLOCK_ERROR_CODE);
+            assert!(response.violation().is_some());
+            assert!(backend.next().is_none());
+            assert_eq!(*calls.borrow(), 0);
+        }
     }
 }
