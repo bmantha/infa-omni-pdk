@@ -44,7 +44,11 @@ setup: install-cargo-anypoint install-llvm-cov ## Setup Cargo Anypoint to build,
 
 playground/config/registration.yaml tests/config/registration.yaml: ## Generate a disconnected registration.yaml from the local flex gateway
 	docker image pull $(FLEX_IMAGE)
+ifeq ($(OS), Windows_NT)
 	docker run --rm --entrypoint flexctl -v "$(CURDIR)/$(@D)":/registration $(FLEX_IMAGE) registration create --mode disconnected --output-directory=/registration testing-flex
+else
+	docker run --rm --user "$$(id -u):$$(id -g)" --entrypoint flexctl -v "$(CURDIR)/$(@D)":/registration $(FLEX_IMAGE) registration create --mode disconnected --output-directory=/registration testing-flex
+endif
 
 .PHONY: build
 build: build-asset-files ## Build the policy definition and implementation

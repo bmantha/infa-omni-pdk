@@ -9,6 +9,23 @@ import test from 'node:test';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 
+test('registration uses the host UID and GID only on POSIX', () => {
+  for (const os of ['', 'Windows_NT']) {
+    for (const target of ['playground/config/registration.yaml', 'tests/config/registration.yaml']) {
+      const result = spawnSync('make', ['-B', '-n', target, `OS=${os}`, 'SHELL=/bin/sh'],
+        { cwd: root, encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      const command = result.stdout.split('\n').find(line => line.startsWith('docker run '));
+      assert.ok(command, 'registration must invoke Docker');
+      if (os === 'Windows_NT') {
+        assert.doesNotMatch(command, /--user|\bid\b/);
+      } else {
+        assert.ok(command.includes('--user "$(id -u):$(id -g)"'), command);
+      }
+    }
+  }
+});
+
 test('demo pins its fixture and disables dotenv for startup and cleanup', () => {
   const directory = mkdtempSync(join(tmpdir(), 'classification-demo-'));
   try {
