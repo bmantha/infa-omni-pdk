@@ -1,6 +1,8 @@
 use serde::Deserialize;
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
+    #[serde(alias = "allowInsecureLocalServices")]
+    pub allow_insecure_local_services: Option<bool>,
     #[serde(alias = "blockOnUnknownClassification")]
     pub block_on_unknown_classification: Option<bool>,
     #[serde(

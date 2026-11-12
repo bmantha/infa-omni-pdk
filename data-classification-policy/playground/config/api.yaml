@@ -17,10 +17,10 @@ spec:
         name: data-classification-policy-flex-v1-0 # Overridden during 'make run' execution
         namespace: default
       config:
-        # Points at the local cdgclogin/cdgcapi mock containers (see mocks/mock_server.py). To
-        # demo against a live CDGC org, swap in real URLs/creds locally -- never commit them.
+        # Local mock fixture only. Live credentials belong in playground/private/api.yaml.
         cdgcLoginUrl: http://cdgclogin
         cdgcBaseApiUrl: http://cdgcapi
+        allowInsecureLocalServices: true
         cdgcOrgUsername: dummy-cdgc-username
         cdgcOrgPassword: dummy-cdgc-password
         # PATIENT_ID, FULL_NAME (MEDIUM), APPOINTMENT_DATE and VISIT_REASON (both unclassified in

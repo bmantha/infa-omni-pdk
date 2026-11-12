@@ -1,25 +1,125 @@
 // Copyright 2026 Salesforce, Inc. All rights reserved.
 mod generated;
+mod storage;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, StoreMode};
-use pdk::hl::timer::Clock;
+use pdk::hl::timer::{Clock, Timer};
 use pdk::hl::*;
 use pdk::logger;
+use pdk::metadata::Metadata;
 use pdk::policy_violation::PolicyViolations;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::generated::config::Config;
 
 fn parse_config(bytes: &[u8]) -> Result<Config> {
     // Serde's Display may contain input values; retain only non-sensitive diagnostics.
-    serde_json::from_slice(bytes).map_err(|err| {
-        anyhow!("configuration: invalid JSON ({:?}, line {}, column {})", err.classify(), err.line(), err.column())
-    })
+    let config: Config = serde_json::from_slice(bytes).map_err(|err| {
+        anyhow!(
+            "configuration: invalid JSON ({:?}, line {}, column {})",
+            err.classify(),
+            err.line(),
+            err.column()
+        )
+    })?;
+    let ids = parse_governed_column_ids(&config);
+    if rank_of(&config.max_allowed_classification).is_none()
+        || !(1..=10_000).contains(&config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS))
+        || config
+            .refresh_interval_seconds
+            .unwrap_or(DEFAULT_REFRESH_INTERVAL_SECONDS)
+            < 30
+        || ids.is_empty()
+        || ids.len() > MAX_COLUMNS
+        || config.governed_column_ids.len() > MAX_COLUMNS * (MAX_ID_BYTES + 1)
+        || ids.iter().any(|id| !valid_text(id, MAX_ID_BYTES))
+        || !valid_text(&config.cdgc_org_username, MAX_TOKEN_BYTES)
+        || config.cdgc_org_password.is_empty()
+        || config.cdgc_org_password.len() > MAX_TOKEN_BYTES
+    {
+        return Err(anyhow!("Invalid classification gate configuration bounds"));
+    }
+    for service in [&config.cdgc_login_url, &config.cdgc_base_api_url] {
+        let uri = service.uri();
+        if uri.authority().is_empty()
+            || uri.authority().contains('@')
+            || (!uri.scheme().eq_ignore_ascii_case("https")
+                && !(config.allow_insecure_local_services.unwrap_or(false)
+                    && uri.scheme().eq_ignore_ascii_case("http")))
+        {
+            return Err(anyhow!(
+                "CDGC services require HTTPS; HTTP is a local-test-only opt-in"
+            ));
+        }
+    }
+    Ok(config)
+}
+
+const MAX_REQUEST_BYTES: usize = 1_048_576;
+const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_COLUMNS: usize = 32;
+const MAX_REFS_PER_COLUMN: usize = 32;
+const MAX_CLASSIFICATIONS: usize = 256;
+const MAX_ID_BYTES: usize = 256;
+const MAX_NAME_BYTES: usize = 128;
+const MAX_TOKEN_BYTES: usize = 8192;
+const RELATIONAL_COLUMN_CLASS_TYPE: &str = "com.infa.odin.models.relational.Column";
+
+fn valid_text(value: &str, limit: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+}
+
+#[derive(Debug)]
+struct IntegrityFailure;
+impl std::fmt::Display for IntegrityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CDGC integrity failure")
+    }
+}
+impl std::error::Error for IntegrityFailure {}
+
+fn integrity(stage: &'static str) -> anyhow::Error {
+    anyhow::Error::new(IntegrityFailure).context(stage)
+}
+
+fn cdgc_json<T: serde::de::DeserializeOwned>(body: &[u8], stage: &'static str) -> Result<T> {
+    serde_json::from_slice(body).map_err(|err| cdgc_json_error(stage, err))
+}
+
+fn cdgc_json_error(stage: &'static str, err: serde_json::Error) -> anyhow::Error {
+    anyhow::Error::new(IntegrityFailure).context(format!(
+        "{stage}: invalid JSON ({:?}, line {}, column {})",
+        err.classify(),
+        err.line(),
+        err.column()
+    ))
+}
+
+// Check the host's size before copying. Error bodies need not be copied at all.
+fn bounded_response(
+    size: usize,
+    status: u32,
+    read_body: impl FnOnce() -> Option<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow!("CDGC HTTP status {status}"));
+    }
+    if size > MAX_RESPONSE_BYTES {
+        return Err(integrity("CDGC response exceeds size limit"));
+    }
+    let body = read_body().ok_or_else(|| integrity("CDGC response unavailable"))?;
+    if body.len() != size {
+        return Err(integrity("CDGC response truncated"));
+    }
+    Ok(body)
 }
 
 #[pdk::hl::entrypoint_flex]
@@ -33,8 +133,9 @@ fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<()> {
 
 /// Namespaces for the two PDK-native [`DataStorage`] instances this policy uses -- mirrors
 /// dq-gate-policy's cache/lock split (different lifetimes, different remote-namespace TTLs).
-const RANK_CACHE_NAMESPACE: &str = "classification-gate-rank";
-const REFRESH_LOCK_NAMESPACE: &str = "classification-gate-refresh-lock";
+// v3 also invalidates name-only observations that never verified the relational Column type.
+const RANK_CACHE_NAMESPACE: &str = "classification-gate-rank-v3";
+const REFRESH_LOCK_NAMESPACE: &str = "classification-gate-refresh-lock-v3";
 
 const RANK_CACHE_KEY_PREFIX: &str = "classification-rank-";
 const REFRESH_LOCK_KEY_PREFIX: &str = "classification-refresh-lock-";
@@ -135,8 +236,8 @@ const A2A_HOUSEKEEPING_METHODS: &[&str] = &[
 
 /// A single governed column's resolved name and rank, kept alongside the aggregate [`CachedRank`]
 /// so a block message can name the offending column(s) even when served from cache (the common
-/// path). `name` is the CDGC `summary.core.name` for the column, falling back to the column id
-/// when CDGC omits it. `rank` follows [`rank_of`]: 0 = unclassified.
+/// path). `name` must be a bounded, meaningful CDGC `summary.core.name`.
+/// `rank` follows [`rank_of`]: 0 = unclassified.
 #[derive(Serialize, Deserialize, Clone)]
 struct ColumnRank {
     name: String,
@@ -146,15 +247,27 @@ struct ColumnRank {
 /// The cached worst-case rank across all of `governedColumnIds`, and when it was fetched --
 /// compared against `refreshIntervalSeconds` on every request to decide whether a live CDGC
 /// fetch is needed. `rank` follows [`rank_of`]: 0 = unclassified/no governed columns carry a
-/// classification, 1 = LOW, 2 = MEDIUM, 3 = HIGH. `columns` is `#[serde(default)]` so a cache
-/// entry written before this field existed still deserializes (as an empty list, falling back to
-/// the tier-only message).
+/// classification, 1 = LOW, 2 = MEDIUM, 3 = HIGH. Timestamps are observation-start nanoseconds;
+/// every entry must carry the complete bounded column list. Old namespaces are not reused.
 #[derive(Serialize, Deserialize, Clone)]
 struct CachedRank {
     rank: u8,
     timestamp: i64,
-    #[serde(default)]
     columns: Vec<ColumnRank>,
+    integrity_failed: bool,
+}
+
+// One immutable configuration owns one cache key, so a single slot bounds local quarantine.
+#[derive(Default)]
+struct Quarantine {
+    timestamp: Option<i64>,
+    generation: u64,
+}
+impl Quarantine {
+    fn mark(&mut self, timestamp: i64) {
+        self.timestamp = Some(self.timestamp.unwrap_or(timestamp).max(timestamp));
+        self.generation = self.generation.saturating_add(1);
+    }
 }
 
 /// Result of a live CDGC fetch: the aggregate worst-case rank plus each governed column's own
@@ -193,19 +306,27 @@ struct ClassificationRef {
 
 /// A column asset's own `summary` segment -- just its human-readable `core.name` (e.g.
 /// "VISIT_REASON"), fetched in the same hop-1 batch as `dataClassification` via
-/// `segments=summary,dataClassification` (verified live: no extra CDGC call needed).
+/// `segments=summary,systemAttributes,dataClassification`.
 #[derive(Deserialize, Default)]
 struct Summary {
     #[serde(rename = "core.name")]
     name: Option<String>,
 }
 
+// Official batch details examples place the asset discriminator in systemAttributes.
+#[derive(Deserialize, Default)]
+struct SystemAttributes {
+    #[serde(rename = "core.classType")]
+    class_type: Option<String>,
+}
+
 /// A column asset's `dataClassification` segment, as returned by the batched
-/// `data360/search/v1/assets/details` read (`segments=summary,dataClassification`). `core_identity`
+/// `data360/search/v1/assets/details` read with summary, systemAttributes and classifications.
+/// `core_identity`
 /// is `None` only when CDGC could not resolve the requested id at all (an empty `{}` body for a
 /// single read; simply absent from the batch array) -- that is a config-resolution error, never
-/// "unclassified". A column WITH `core_identity` but no `dataClassification` key is genuinely
-/// unclassified: the field defaults to empty via `#[serde(default)]`, since CDGC omits the key
+/// "unclassified". Only the exact relational Column class with a meaningful summary name may
+/// be unclassified: the field defaults to empty via `#[serde(default)]`, since CDGC omits the key
 /// entirely rather than returning an empty array for an unclassified column (confirmed live).
 #[derive(Deserialize, Default)]
 struct AssetClassificationSegment {
@@ -213,6 +334,8 @@ struct AssetClassificationSegment {
     core_identity: Option<String>,
     #[serde(rename = "summary", default)]
     summary: Summary,
+    #[serde(rename = "systemAttributes", default)]
+    system_attributes: SystemAttributes,
     #[serde(rename = "dataClassification", default)]
     data_classification: Vec<ClassificationRef>,
 }
@@ -237,7 +360,10 @@ struct ClassificationSensitivity {
 /// Data threaded from the request filter to the response filter, used only to annotate the
 /// (allowed) response with diagnostic headers -- never consulted for the block decision.
 enum ClassificationGateData {
-    Evaluated { rank: Option<u8>, status: &'static str },
+    Evaluated {
+        rank: Option<u8>,
+        status: &'static str,
+    },
 }
 
 // ── Shared timing/encoding helpers -- identical to dq-gate-policy's, protocol/score agnostic ──
@@ -253,13 +379,29 @@ fn next_call_timeout(per_call_ms: i64, elapsed_ms: i64) -> Option<Duration> {
     if remaining <= 0 {
         return None;
     }
-    Some(Duration::from_millis(remaining.min(per_call_ms.max(0)) as u64))
+    Some(Duration::from_millis(
+        remaining.min(per_call_ms.max(0)) as u64
+    ))
 }
 
 fn unix_seconds(time: SystemTime) -> i64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn observation_timestamp(time: SystemTime) -> Option<i64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+}
+
+async fn within_deadline<F: std::future::Future>(work: F, clock: &Timer) -> Option<F::Output> {
+    let deadline = clock.sleep(Duration::from_millis(CDGC_REFRESH_BUDGET_MS as u64));
+    match futures::future::select(Box::pin(work), Box::pin(deadline)).await {
+        futures::future::Either::Left((value, _)) => Some(value),
+        futures::future::Either::Right((_, _)) => None,
+    }
 }
 
 fn percent_encode(value: &str) -> String {
@@ -334,11 +476,20 @@ fn governed_columns_key(config: &Config) -> String {
 }
 
 fn rank_cache_key(config: &Config) -> String {
-    format!("{RANK_CACHE_KEY_PREFIX}{}", governed_columns_key(config))
+    let identity = serde_json::json!([
+        config.cdgc_login_url.uri().to_string(),
+        config.cdgc_base_api_url.uri().to_string(),
+        config.cdgc_org_username,
+        governed_columns_key(config)
+    ]);
+    format!(
+        "{RANK_CACHE_KEY_PREFIX}{:x}",
+        Sha256::digest(identity.to_string().as_bytes())
+    )
 }
 
 fn refresh_lock_key(config: &Config) -> String {
-    format!("{REFRESH_LOCK_KEY_PREFIX}{}", governed_columns_key(config))
+    format!("{REFRESH_LOCK_KEY_PREFIX}{}", rank_cache_key(config))
 }
 
 fn rank_store_ttl_ms(config: &Config) -> u32 {
@@ -363,6 +514,13 @@ fn parse_jsonrpc_call(body: &[u8]) -> Option<(String, Option<Value>)> {
         return None;
     }
     let method = obj.get("method")?.as_str()?.to_string();
+    if method.is_empty()
+        || obj
+            .get("params")
+            .is_some_and(|p| !p.is_object() && !p.is_array())
+    {
+        return None;
+    }
     let id = obj.get("id").cloned();
     Some((method, id))
 }
@@ -414,6 +572,21 @@ fn a2a_rest_send_path(path: &str) -> bool {
     )
 }
 
+fn a2a_rest_control_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let mut segments = path.rsplit('/');
+    let last = segments.next().unwrap_or_default();
+    if [":cancel", ":subscribe"]
+        .iter()
+        .any(|suffix| last.strip_suffix(suffix).is_some_and(|id| !id.is_empty()))
+    {
+        return segments.next() == Some("tasks");
+    }
+    last == "pushNotificationConfigs"
+        && segments.next().is_some_and(|id| !id.is_empty())
+        && segments.next() == Some("tasks")
+}
+
 // ── Block-response shaping ───────────────────────────────────────────────────────────────────
 
 /// The human-readable block message. `discloseClassificationDetails` (default false) controls
@@ -421,7 +594,12 @@ fn a2a_rest_send_path(path: &str) -> bool {
 /// offending column name(s) -- is revealed to the client; the full detail is always recorded
 /// server-side by the `warn!` in `request_filter` regardless. `offending` (columns whose rank
 /// exceeds the ceiling) is only ever non-empty on the disclose path.
-fn block_message(disclose: bool, rank: Option<u8>, offending: &[ColumnRank], config: &Config) -> String {
+fn block_message(
+    disclose: bool,
+    rank: Option<u8>,
+    offending: &[ColumnRank],
+    config: &Config,
+) -> String {
     if disclose {
         match rank {
             Some(rank) => {
@@ -447,18 +625,32 @@ fn block_message(disclose: bool, rank: Option<u8>, offending: &[ColumnRank], con
     }
 }
 
-fn block_headers(disclose: bool, rank: Option<u8>, offending: &[ColumnRank]) -> Vec<(String, String)> {
+fn block_headers(
+    disclose: bool,
+    rank: Option<u8>,
+    offending: &[ColumnRank],
+) -> Vec<(String, String)> {
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     if disclose {
         if let Some(rank) = rank {
-            headers.push((HEADER_CLASSIFICATION_RANK.to_string(), rank_label(rank).to_string()));
+            headers.push((
+                HEADER_CLASSIFICATION_RANK.to_string(),
+                rank_label(rank).to_string(),
+            ));
         }
         if !offending.is_empty() {
-            let columns = offending.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(",");
+            let columns = offending
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             headers.push((HEADER_CLASSIFICATION_COLUMNS.to_string(), columns));
         }
     }
-    headers.push((HEADER_CLASSIFICATION_STATUS.to_string(), "blocked".to_string()));
+    headers.push((
+        HEADER_CLASSIFICATION_STATUS.to_string(),
+        "blocked".to_string(),
+    ));
     headers
 }
 
@@ -478,7 +670,12 @@ fn build_block_response(
     }
 }
 
-fn block_response(rpc_id: Option<Value>, rank: Option<u8>, offending: &[ColumnRank], config: &Config) -> Response {
+fn block_response(
+    rpc_id: Option<Value>,
+    rank: Option<u8>,
+    offending: &[ColumnRank],
+    config: &Config,
+) -> Response {
     let disclose = config.disclose_classification_details.unwrap_or(false);
     let message = block_message(disclose, rank, offending, config);
     let body = serde_json::json!({
@@ -492,19 +689,31 @@ fn block_response(rpc_id: Option<Value>, rank: Option<u8>, offending: &[ColumnRa
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
-fn a2a_error_info(disclose: bool, rank: Option<u8>, offending: &[ColumnRank], config: &Config) -> Value {
+fn a2a_error_info(
+    disclose: bool,
+    rank: Option<u8>,
+    offending: &[ColumnRank],
+    config: &Config,
+) -> Value {
     let mut metadata = serde_json::Map::new();
     if disclose {
         if let Some(rank) = rank {
-            metadata.insert("tier".to_string(), Value::String(rank_label(rank).to_string()));
+            metadata.insert(
+                "tier".to_string(),
+                Value::String(rank_label(rank).to_string()),
+            );
         }
         metadata.insert(
             "maxAllowedClassification".to_string(),
             Value::String(config.max_allowed_classification.clone()),
         );
         if !offending.is_empty() {
-            let columns: Vec<Value> = offending.iter().map(|c| Value::String(c.name.clone())).collect();
-            metadata.insert("columns".to_string(), Value::Array(columns));
+            let columns = offending
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            metadata.insert("columns".to_string(), Value::String(columns));
         }
     }
     serde_json::json!({
@@ -530,7 +739,9 @@ fn a2a_jsonrpc_block_response(
     error.insert("message".to_string(), Value::String(message));
 
     let data = match version {
-        A2aVersion::V1_0 => Some(serde_json::json!([a2a_error_info(disclose, rank, offending, config)])),
+        A2aVersion::V1_0 => Some(serde_json::json!([a2a_error_info(
+            disclose, rank, offending, config
+        )])),
         A2aVersion::V0_3 if disclose => Some(Value::String(A2A_ERROR_REASON.to_string())),
         A2aVersion::V0_3 => None,
     };
@@ -549,7 +760,11 @@ fn a2a_jsonrpc_block_response(
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
-fn a2a_rest_block_response(rank: Option<u8>, offending: &[ColumnRank], config: &Config) -> Response {
+fn a2a_rest_block_response(
+    rank: Option<u8>,
+    offending: &[ColumnRank],
+    config: &Config,
+) -> Response {
     let disclose = config.disclose_classification_details.unwrap_or(false);
     let message = block_message(disclose, rank, offending, config);
 
@@ -568,43 +783,110 @@ fn a2a_rest_block_response(rank: Option<u8>, offending: &[ColumnRank], config: &
 
 // ── Cache/lock plumbing -- identical structure to dq-gate-policy's, see its src/lib.rs ────────
 
-async fn read_cached_rank<S: DataStorage>(store: &S, key: &str) -> Option<CachedRank> {
-    match store.get::<CachedRank>(key).await {
-        Ok(Some((cached, _version))) => Some(cached),
-        Ok(None) => None,
-        Err(err) => {
-            logger::warn!("Failed to read cached classification rank from data storage: {err}");
-            None
-        }
-    }
+fn valid_cached_rank(cached: &CachedRank, now: i64, column_count: usize) -> bool {
+    !cached.integrity_failed && valid_cache_shape(cached, now, column_count)
 }
 
-async fn write_cached_rank<S: DataStorage>(store: &S, key: &str, cached: &CachedRank) {
+fn valid_cache_shape(cached: &CachedRank, now: i64, column_count: usize) -> bool {
+    cached.timestamp >= 0
+        && cached.timestamp <= now
+        && cached.rank <= 3
+        && cached.columns.len() == column_count
+        && column_count <= MAX_COLUMNS
+        && cached
+            .columns
+            .iter()
+            .all(|col| col.rank <= 3 && valid_text(&col.name, MAX_NAME_BYTES))
+        && cached.columns.iter().map(|col| col.rank).max() == Some(cached.rank)
+}
+
+async fn write_cached_rank<S: DataStorage>(
+    store: &S,
+    key: &str,
+    cached: &CachedRank,
+    now: impl Fn() -> Option<i64>,
+) -> Option<CachedRank> {
+    if !valid_cache_shape(cached, now()?, cached.columns.len()) {
+        return None;
+    }
     for _ in 0..CAS_MAX_RETRIES {
         match store.get::<CachedRank>(key).await {
-            Ok(Some((_, version))) => match store.store(key, &StoreMode::Cas(version), cached).await {
-                Ok(()) => return,
-                Err(DataStorageError::CasMismatch) => continue,
-                Err(err) => {
-                    logger::warn!("Failed to persist refreshed classification rank: {err}");
-                    return;
+            Ok(Some((existing, version))) => {
+                let current_time = now()?;
+                if valid_cache_shape(&existing, current_time, cached.columns.len())
+                    && existing.timestamp >= cached.timestamp
+                {
+                    return valid_cached_rank(&existing, current_time, cached.columns.len())
+                        .then_some(existing);
                 }
-            },
+                match store.store(key, &StoreMode::Cas(version), cached).await {
+                    Ok(()) => return (!cached.integrity_failed).then(|| cached.clone()),
+                    Err(DataStorageError::CasMismatch) => continue,
+                    Err(_) => {
+                        logger::warn!("Failed to persist refreshed classification rank");
+                        return None;
+                    }
+                }
+            }
             Ok(None) => match store.store(key, &StoreMode::Absent, cached).await {
-                Ok(()) => return,
+                Ok(()) => return (!cached.integrity_failed).then(|| cached.clone()),
                 Err(DataStorageError::CasMismatch) => continue,
-                Err(err) => {
-                    logger::warn!("Failed to persist refreshed classification rank: {err}");
-                    return;
+                Err(_) => {
+                    logger::warn!("Failed to persist refreshed classification rank");
+                    return None;
                 }
             },
-            Err(err) => {
-                logger::warn!("Failed to read classification rank before persisting refresh: {err}");
-                return;
+            Err(_) => {
+                logger::warn!("Failed to read classification rank before persisting refresh");
+                return None;
             }
         }
     }
-    logger::warn!("Exhausted CAS retries persisting refreshed classification rank for key '{key}'");
+    logger::warn!("Exhausted CAS retries persisting refreshed classification rank");
+    None
+}
+
+async fn fallback_rank<S: DataStorage>(
+    store: &S,
+    key: &str,
+    clock: &Timer,
+    column_count: usize,
+    quarantine: &RefCell<Quarantine>,
+) -> Option<CachedRank> {
+    let (winner, _) = store.get::<CachedRank>(key).await.ok()??;
+    let now = observation_timestamp(clock.now())?;
+    if !valid_cached_rank(&winner, now, column_count) {
+        quarantine.borrow_mut().mark(now);
+        return None;
+    }
+    if quarantine.borrow().timestamp.is_some() {
+        return None;
+    }
+    Some(winner)
+}
+
+async fn invalidate_rank<S: DataStorage>(
+    store: &S,
+    key: &str,
+    timestamp: i64,
+    column_count: usize,
+    clock: &Timer,
+    quarantine: &RefCell<Quarantine>,
+) {
+    quarantine.borrow_mut().mark(timestamp);
+    // Persist a CAS-ordered invalidation, never DELETE (gossip tombstones race writes).
+    let invalid = CachedRank {
+        rank: 0,
+        timestamp,
+        integrity_failed: true,
+        columns: (0..column_count)
+            .map(|_| ColumnRank {
+                name: "Unknown".to_string(),
+                rank: 0,
+            })
+            .collect(),
+    };
+    let _ = write_cached_rank(store, key, &invalid, || observation_timestamp(clock.now())).await;
 }
 
 async fn try_acquire_refresh_lock<S: DataStorage>(
@@ -617,10 +899,16 @@ async fn try_acquire_refresh_lock<S: DataStorage>(
         Ok(()) => Ok(true),
         Err(DataStorageError::CasMismatch) => match lock_store.get::<RefreshLock>(key).await? {
             Some((existing, version)) => {
-                if now - existing.acquired_at < REFRESH_LOCK_TTL_SECONDS {
+                if existing.acquired_at < 0
+                    || existing.acquired_at > now
+                    || now.saturating_sub(existing.acquired_at) < REFRESH_LOCK_TTL_SECONDS
+                {
                     Ok(false)
                 } else {
-                    match lock_store.store(key, &StoreMode::Cas(version), &entry).await {
+                    match lock_store
+                        .store(key, &StoreMode::Cas(version), &entry)
+                        .await
+                    {
                         Ok(()) => Ok(true),
                         Err(DataStorageError::CasMismatch) => Ok(false),
                         Err(err) => Err(err),
@@ -645,7 +933,7 @@ async fn try_acquire_refresh_lock<S: DataStorage>(
 async fn cdgc_login_and_jwt(
     client: &HttpClient,
     config: &Config,
-    clock: &Clock,
+    clock: &Timer,
     start: SystemTime,
     per_call_ms: i64,
 ) -> Result<(CdgcLoginResponse, CdgcJwtResponse)> {
@@ -654,34 +942,45 @@ async fn cdgc_login_and_jwt(
         "password": config.cdgc_org_password,
     }))?;
 
-    let login_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
-        anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before Login")
-    })?;
+    let login_timeout =
+        next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
+            anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before Login")
+        })?;
     let login_response = client
         .request(&config.cdgc_login_url)
+        .extract_with(|event, buffers| {
+            bounded_response(event.body_size, buffers.status_code(), || {
+                buffers.body(0, MAX_RESPONSE_BYTES)
+            })
+        })
         .path("/identity-service/api/v1/Login")
         .headers(vec![("Content-Type", "application/json")])
         .body(&login_body)
         .timeout(login_timeout)
         .post()
         .await
-        .map_err(|err| anyhow!("CDGC login failed: {err}"))?;
-
-    if login_response.status_code() >= 300 {
-        // Status code only -- never the body, which echoes sessionId/credential detail.
-        return Err(anyhow!("CDGC login returned status {}", login_response.status_code()));
+        .map_err(|_| anyhow!("CDGC login transport failure"))??;
+    let login: CdgcLoginResponse = cdgc_json(&login_response, "CDGC Login")?;
+    if !valid_text(&login.session_id, MAX_TOKEN_BYTES) || !valid_text(&login.org_id, MAX_ID_BYTES) {
+        return Err(integrity("Invalid CDGC Login identity"));
     }
-    let login: CdgcLoginResponse = serde_json::from_slice(login_response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC login response: {err}"))?;
 
     let nonce = percent_encode(&nonce_from_time(clock.now()));
     let jwt_path = format!("/identity-service/api/v1/jwt/Token?client_id=idmc_api&nonce={nonce}");
     let cookie = format!("USER_SESSION={}", login.session_id);
-    let jwt_timeout = next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
-        anyhow!("CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before JWT fetch")
-    })?;
+    let jwt_timeout =
+        next_call_timeout(per_call_ms, elapsed_ms(start, clock.now())).ok_or_else(|| {
+            anyhow!(
+                "CDGC refresh exceeded {CDGC_REFRESH_BUDGET_MS}ms latency budget before JWT fetch"
+            )
+        })?;
     let jwt_response = client
         .request(&config.cdgc_login_url)
+        .extract_with(|event, buffers| {
+            bounded_response(event.body_size, buffers.status_code(), || {
+                buffers.body(0, MAX_RESPONSE_BYTES)
+            })
+        })
         .path(&jwt_path)
         .headers(vec![
             ("cookie", cookie.as_str()),
@@ -690,13 +989,11 @@ async fn cdgc_login_and_jwt(
         .timeout(jwt_timeout)
         .get()
         .await
-        .map_err(|err| anyhow!("CDGC JWT fetch failed: {err}"))?;
-
-    if jwt_response.status_code() >= 300 {
-        return Err(anyhow!("CDGC JWT fetch returned status {}", jwt_response.status_code()));
+        .map_err(|_| anyhow!("CDGC JWT transport failure"))??;
+    let jwt: CdgcJwtResponse = cdgc_json(&jwt_response, "CDGC JWT")?;
+    if !valid_text(&jwt.jwt_token, MAX_TOKEN_BYTES) {
+        return Err(integrity("Invalid CDGC JWT"));
     }
-    let jwt: CdgcJwtResponse = serde_json::from_slice(jwt_response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC JWT response: {err}"))?;
 
     Ok((login, jwt))
 }
@@ -718,6 +1015,11 @@ async fn fetch_details_batch(
     let body = serde_json::to_vec(ids)?;
     let response = client
         .request(&config.cdgc_base_api_url)
+        .extract_with(|event, buffers| {
+            bounded_response(event.body_size, buffers.status_code(), || {
+                buffers.body(0, MAX_RESPONSE_BYTES)
+            })
+        })
         .path(&path)
         .headers(vec![
             ("Authorization", authorization),
@@ -728,16 +1030,23 @@ async fn fetch_details_batch(
         .timeout(timeout)
         .post()
         .await
-        .map_err(|err| anyhow!("CDGC details batch fetch failed (segments={segments}): {err}"))?;
-
-    if response.status_code() >= 300 {
-        return Err(anyhow!(
-            "CDGC details batch fetch returned status {} (segments={segments})",
-            response.status_code()
-        ));
+        .map_err(|_| anyhow!("CDGC details transport failure"))??;
+    let entries: Vec<Value> = cdgc_json(&response, "CDGC details")?;
+    if entries.len() > ids.len() {
+        return Err(integrity("CDGC details entry count mismatch"));
     }
-    serde_json::from_slice(response.body())
-        .map_err(|err| anyhow!("Failed to parse CDGC details batch response (segments={segments}): {err}"))
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        let id = entry
+            .get("core.identity")
+            .and_then(Value::as_str)
+            .filter(|id| valid_text(id, MAX_ID_BYTES))
+            .ok_or_else(|| integrity("CDGC details identity missing"))?;
+        if !ids.iter().any(|expected| expected == id) || !seen.insert(id) {
+            return Err(integrity("CDGC details unexpected or duplicate identity"));
+        }
+    }
+    Ok(entries)
 }
 
 /// Runs the live CDGC sequence (Login -> JWT -> two batched detail hops) and reduces the result
@@ -754,21 +1063,26 @@ async fn fetch_details_batch(
 /// CDGC has since deleted) -- this fails the whole fetch rather than silently treating an
 /// unresolvable configured asset as "unclassified, allow" (CDGC's nonexistent-asset response is
 /// HTTP 200 + `{}`, not a 404, so this check is the only thing that catches it).
-async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock) -> Result<RankOutcome> {
+async fn fetch_cdgc_max_rank(
+    client: &HttpClient,
+    config: &Config,
+    clock: &Timer,
+) -> Result<RankOutcome> {
     let start = clock.now();
     let per_call_ms = config.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
 
     let column_ids = parse_governed_column_ids(config);
     if column_ids.is_empty() {
-        return Err(anyhow!("governedColumnIds resolved to an empty list of column ids"));
+        return Err(anyhow!(
+            "governedColumnIds resolved to an empty list of column ids"
+        ));
     }
 
     let (login, jwt) = cdgc_login_and_jwt(client, config, clock, start, per_call_ms).await?;
     let authorization = format!("Bearer {}", jwt.jwt_token);
 
-    // Hop 1: column -> linked classification id(s) + name, batched in chunks of
-    // CDGC_BATCH_CHUNK_SIZE. `summary` is bundled onto this same call (verified live: no extra
-    // CDGC round trip) so the block message can later name the offending column.
+    // Hop 1 validates the exact relational Column type before accepting any classification
+    // result, including a missing dataClassification segment (unclassified).
     let mut column_to_classifications: HashMap<String, Vec<String>> = HashMap::new();
     let mut column_names: HashMap<String, String> = HashMap::new();
     let mut distinct_classification_ids: HashSet<String> = HashSet::new();
@@ -782,7 +1096,7 @@ async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock
             config,
             &authorization,
             &login.org_id,
-            "summary,dataClassification",
+            "summary,systemAttributes,dataClassification",
             chunk,
             timeout,
         )
@@ -791,22 +1105,37 @@ async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock
             .into_iter()
             .map(serde_json::from_value)
             .collect::<serde_json::Result<_>>()
-            .map_err(|err| anyhow!("Failed to parse dataClassification batch entry: {err}"))?;
+            .map_err(|err| cdgc_json_error("CDGC dataClassification entry", err))?;
         let mut by_id: HashMap<String, AssetClassificationSegment> = segments
             .into_iter()
             .filter_map(|segment| segment.core_identity.clone().map(|id| (id, segment)))
             .collect();
 
         for column_id in chunk {
-            let segment = by_id.remove(column_id).ok_or_else(|| {
-                anyhow!(
-                    "CDGC could not resolve configured column asset id '{column_id}' from governedColumnIds (misconfigured or deleted asset)"
-                )
-            })?;
-            column_names.insert(
-                column_id.clone(),
-                segment.summary.name.clone().unwrap_or_else(|| column_id.clone()),
-            );
+            let segment = by_id
+                .remove(column_id)
+                .ok_or_else(|| integrity("CDGC configured column unresolved"))?;
+            if segment.system_attributes.class_type.as_deref() != Some(RELATIONAL_COLUMN_CLASS_TYPE)
+            {
+                return Err(integrity(
+                    "CDGC relational Column class type missing or invalid",
+                ));
+            }
+            let name = segment
+                .summary
+                .name
+                .as_deref()
+                .filter(|name| valid_text(name, MAX_NAME_BYTES))
+                .ok_or_else(|| integrity("CDGC column summary name missing or invalid"))?;
+            if segment.data_classification.len() > MAX_REFS_PER_COLUMN
+                || segment
+                    .data_classification
+                    .iter()
+                    .any(|r| !valid_text(&r.core_identity, MAX_ID_BYTES))
+            {
+                return Err(integrity("CDGC classification reference bounds"));
+            }
+            column_names.insert(column_id.clone(), name.to_string());
             let refs: Vec<String> = segment
                 .data_classification
                 .into_iter()
@@ -814,6 +1143,9 @@ async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock
                 .collect();
             for classification_id in &refs {
                 distinct_classification_ids.insert(classification_id.clone());
+                if distinct_classification_ids.len() > MAX_CLASSIFICATIONS {
+                    return Err(integrity("CDGC distinct classification bounds"));
+                }
             }
             column_to_classifications.insert(column_id.clone(), refs);
         }
@@ -841,22 +1173,22 @@ async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock
             .into_iter()
             .map(serde_json::from_value)
             .collect::<serde_json::Result<_>>()
-            .map_err(|err| anyhow!("Failed to parse selfAttributes batch entry: {err}"))?;
+            .map_err(|err| cdgc_json_error("CDGC selfAttributes entry", err))?;
         let mut by_id: HashMap<String, ClassificationSensitivity> = segments
             .into_iter()
             .filter_map(|segment| segment.core_identity.clone().map(|id| (id, segment)))
             .collect();
 
         for classification_id in chunk {
-            let entry = by_id.remove(classification_id).ok_or_else(|| {
-                anyhow!("CDGC could not resolve linked classification asset id '{classification_id}'")
-            })?;
-            let sensitivity = entry.self_attributes.sensitivity.ok_or_else(|| {
-                anyhow!("CDGC classification asset '{classification_id}' has no core.sensitivity value")
-            })?;
-            let rank = rank_of(&sensitivity).ok_or_else(|| {
-                anyhow!("CDGC classification asset '{classification_id}' has unrecognized core.sensitivity '{sensitivity}'")
-            })?;
+            let entry = by_id
+                .remove(classification_id)
+                .ok_or_else(|| integrity("CDGC linked classification unresolved"))?;
+            let sensitivity = entry
+                .self_attributes
+                .sensitivity
+                .ok_or_else(|| integrity("CDGC sensitivity missing"))?;
+            let rank =
+                rank_of(&sensitivity).ok_or_else(|| integrity("CDGC sensitivity unknown"))?;
             classification_to_rank.insert(classification_id.clone(), rank);
         }
     }
@@ -871,16 +1203,24 @@ async fn fetch_cdgc_max_rank(client: &HttpClient, config: &Config, clock: &Clock
                 .get(column_id)
                 .into_iter()
                 .flatten()
-                .filter_map(|classification_id| classification_to_rank.get(classification_id).copied())
+                .filter_map(|classification_id| {
+                    classification_to_rank.get(classification_id).copied()
+                })
                 .max()
                 .unwrap_or(0);
-            let name = column_names.get(column_id).cloned().unwrap_or_else(|| column_id.clone());
+            let name = column_names
+                .get(column_id)
+                .cloned()
+                .unwrap_or_else(|| column_id.clone());
             ColumnRank { name, rank }
         })
         .collect();
     let max_rank = columns.iter().map(|c| c.rank).max().unwrap_or(0);
 
-    Ok(RankOutcome { rank: max_rank, columns })
+    Ok(RankOutcome {
+        rank: max_rank,
+        columns,
+    })
 }
 
 /// The core lazy/TTL cache-aside logic -- structurally identical to dq-gate-policy's
@@ -890,7 +1230,8 @@ async fn resolve_max_rank<S: DataStorage>(
     config: &Config,
     rank_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
+    quarantine: &RefCell<Quarantine>,
 ) -> Option<CachedRank> {
     let key = rank_cache_key(config);
     let refresh_interval = config
@@ -899,11 +1240,30 @@ async fn resolve_max_rank<S: DataStorage>(
         .max(0);
     let fail_open = config.fail_open_on_cdgc_error.unwrap_or(true);
 
-    let cached = read_cached_rank(rank_store, &key).await;
-
-    let now = unix_seconds(clock.now());
+    let column_count = parse_governed_column_ids(config).len();
+    let cached = match rank_store.get::<CachedRank>(&key).await {
+        Ok(Some((cached, _))) => {
+            let now = observation_timestamp(clock.now())?;
+            if !valid_cached_rank(&cached, now, column_count) {
+                quarantine.borrow_mut().mark(now);
+                None
+            } else if quarantine.borrow().timestamp.is_some() {
+                None
+            } else {
+                Some(cached)
+            }
+        }
+        Ok(None) => None,
+        Err(_) => {
+            logger::warn!("Classification cache read failed");
+            return None;
+        }
+    };
+    let now = observation_timestamp(clock.now())?;
     let is_stale = match &cached {
-        Some(cached) => now - cached.timestamp > refresh_interval,
+        Some(cached) => {
+            now.saturating_sub(cached.timestamp) > refresh_interval.saturating_mul(1_000_000_000)
+        }
         None => true,
     };
 
@@ -912,27 +1272,37 @@ async fn resolve_max_rank<S: DataStorage>(
             "Using cached classification rank for governed columns '{}': {} (age {}s)",
             config.governed_column_ids,
             cached.as_ref().map(|c| rank_label(c.rank)).unwrap_or("?"),
-            cached.as_ref().map(|c| now - c.timestamp).unwrap_or_default()
+            cached
+                .as_ref()
+                .map(|c| now.saturating_sub(c.timestamp) / 1_000_000_000)
+                .unwrap_or_default()
         );
         return cached;
     }
 
     let lock_key = refresh_lock_key(config);
-    let lock_acquired = match try_acquire_refresh_lock(lock_store, &lock_key, now).await {
-        Ok(acquired) => acquired,
-        Err(err) => {
-            logger::warn!("Failed to acquire classification refresh lock: {err}; proceeding with refresh");
-            true
-        }
-    };
+    let lock_acquired =
+        match try_acquire_refresh_lock(lock_store, &lock_key, unix_seconds(clock.now())).await {
+            Ok(acquired) => acquired,
+            Err(_) => {
+                logger::warn!("Failed to acquire classification refresh lock");
+                false
+            }
+        };
     if !lock_acquired {
         logger::info!(
             "Classification refresh for governed columns '{}' already in progress elsewhere; serving existing cached value",
             config.governed_column_ids
         );
-        return cached;
+        return if fail_open {
+            fallback_rank(rank_store, &key, clock, column_count, quarantine).await
+        } else {
+            None
+        };
     }
 
+    let observation_start = observation_timestamp(clock.now())?;
+    let generation = quarantine.borrow().generation;
     match fetch_cdgc_max_rank(client, config, clock).await {
         Ok(outcome) => {
             logger::info!(
@@ -940,17 +1310,43 @@ async fn resolve_max_rank<S: DataStorage>(
                 config.governed_column_ids,
                 rank_label(outcome.rank)
             );
-            let fresh = CachedRank { rank: outcome.rank, timestamp: now, columns: outcome.columns };
-            write_cached_rank(rank_store, &key, &fresh).await;
-            Some(fresh)
+            let fresh = CachedRank {
+                rank: outcome.rank,
+                timestamp: observation_start,
+                columns: outcome.columns,
+                integrity_failed: false,
+            };
+            let winner = write_cached_rank(rank_store, &key, &fresh, || {
+                observation_timestamp(clock.now())
+            })
+            .await?;
+            let mut state = quarantine.borrow_mut();
+            if state.generation != generation
+                || state.timestamp.is_some_and(|t| winner.timestamp < t)
+            {
+                return None;
+            }
+            state.timestamp = None;
+            Some(winner)
         }
         Err(err) => {
             logger::warn!(
                 "CDGC classification refresh failed for governed columns '{}': {err}",
                 config.governed_column_ids
             );
-            if fail_open {
-                cached
+            if err.downcast_ref::<IntegrityFailure>().is_some() {
+                invalidate_rank(
+                    rank_store,
+                    &key,
+                    observation_start,
+                    column_count,
+                    clock,
+                    quarantine,
+                )
+                .await;
+                None
+            } else if fail_open {
+                fallback_rank(rank_store, &key, clock, column_count, quarantine).await
             } else {
                 None
             }
@@ -968,59 +1364,137 @@ async fn request_filter<S: DataStorage>(
     client: &HttpClient,
     rank_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
     violations: &PolicyViolations,
+    quarantine: &RefCell<Quarantine>,
 ) -> Flow<ClassificationGateData> {
-    let state = request_state.into_headers_body_state().await;
+    let headers = request_state.into_headers_state().await;
 
-    let request_method = state.handler().header(":method").unwrap_or_default();
+    let request_method = headers.handler().header(":method").unwrap_or_default();
     if !request_method.eq_ignore_ascii_case("POST") {
         logger::debug!("Non-POST request ('{request_method}'); passing through ungated");
-        return Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "skipped" });
+        return Flow::Continue(ClassificationGateData::Evaluated {
+            rank: None,
+            status: "skipped",
+        });
     }
-    let content_type = state.handler().header("content-type").unwrap_or_default();
-    if !content_type.to_ascii_lowercase().contains("application/json") {
+    let path = headers.handler().header(":path").unwrap_or_default();
+    if a2a_rest_control_path(&path) {
+        return Flow::Continue(ClassificationGateData::Evaluated {
+            rank: None,
+            status: "skipped",
+        });
+    }
+    let content_type = headers.handler().header("content-type").unwrap_or_default();
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    // GET/SSE, non-JSON, and A2A gRPC are intentionally outside this policy's contract.
+    if !media_type.eq_ignore_ascii_case("application/json")
+        && !media_type.eq_ignore_ascii_case("application/a2a+json")
+    {
         logger::debug!("Non-JSON content-type ('{content_type}'); passing through ungated");
-        return Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "skipped" });
+        return Flow::Continue(ClassificationGateData::Evaluated {
+            rank: None,
+            status: "skipped",
+        });
     }
 
+    if let Some(length) = headers.handler().header("content-length") {
+        match length.parse::<usize>() {
+            Ok(size) if size <= MAX_REQUEST_BYTES => (),
+            _ => {
+                violations.generate_policy_violation();
+                return Flow::Break(
+                    Response::new(413).with_body("Invalid or excessive request length"),
+                );
+            }
+        }
+    }
+    // Keep headers and body held together, including while waiting for the upload deadline.
+    let state = match within_deadline(headers.into_headers_body_state(), clock).await {
+        Some(state) => state,
+        None => {
+            violations.generate_policy_violation();
+            return Flow::Break(
+                Response::new(408).with_body("Classification gate body deadline exceeded"),
+            );
+        }
+    };
     let body = if state.contains_body() {
         state.handler().body()
     } else {
         Vec::new()
     };
 
-    let (protocol, rpc_id) = match parse_jsonrpc_call(&body) {
-        Some((method, rpc_id)) => {
-            if is_notification_method(&method) || rpc_id.is_none() {
-                logger::debug!(
+    if body.len() > MAX_REQUEST_BYTES || serde_json::from_slice::<Value>(&body).is_err() {
+        violations.generate_policy_violation();
+        return Flow::Break(
+            Response::new(if body.len() > MAX_REQUEST_BYTES {
+                413
+            } else {
+                400
+            })
+            .with_body("Invalid or excessive classification gate JSON request"),
+        );
+    }
+    // REST routing is authoritative even when the body camouflages an exempt RPC method.
+    let (protocol, rpc_id) = if a2a_rest_send_path(&path) {
+        (GateProtocol::A2a(A2aBinding::Rest), None)
+    } else {
+        match parse_jsonrpc_call(&body) {
+            Some((method, rpc_id)) => {
+                if is_notification_method(&method) && rpc_id.is_none() {
+                    logger::debug!(
                     "Notification-style request '{method}' (no response permitted); passing through ungated"
                 );
-                return Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "skipped" });
-            }
-            match classify_jsonrpc_method(&method) {
-                RequestClass::Exempt => {
-                    logger::info!("Method '{method}' is exempt from classification gating, passing through");
-                    return Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "skipped" });
+                    return Flow::Continue(ClassificationGateData::Evaluated {
+                        rank: None,
+                        status: "skipped",
+                    });
                 }
-                RequestClass::Gated(protocol) => (protocol, rpc_id),
+                match classify_jsonrpc_method(&method) {
+                    RequestClass::Exempt => {
+                        logger::info!("Method '{method}' is exempt from classification gating, passing through");
+                        return Flow::Continue(ClassificationGateData::Evaluated {
+                            rank: None,
+                            status: "skipped",
+                        });
+                    }
+                    RequestClass::Gated(protocol) => {
+                        if rpc_id
+                            .as_ref()
+                            .is_none_or(|id| !id.is_string() && !id.is_number())
+                        {
+                            violations.generate_policy_violation();
+                            return Flow::Break(
+                                Response::new(400)
+                                    .with_body("Content-bearing invocation requires a valid id"),
+                            );
+                        }
+                        (protocol, rpc_id)
+                    }
+                }
             }
-        }
-        None => {
-            let path = state.handler().header(":path").unwrap_or_default();
-            if a2a_rest_send_path(&path) {
-                logger::info!("Gating A2A HTTP+JSON (REST) message-send binding (path '{path}')");
-                (GateProtocol::A2a(A2aBinding::Rest), None)
-            } else {
-                logger::debug!(
-                    "Request is neither a JSON-RPC 2.0 call nor an A2A REST message-send binding; passing through ungated"
+            None => {
+                violations.generate_policy_violation();
+                return Flow::Break(
+                    Response::new(400).with_body("Expected a single JSON-RPC invocation"),
                 );
-                return Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "skipped" });
             }
         }
     };
 
-    let cached = resolve_max_rank(client, config, rank_store, lock_store, clock).await;
+    let cached = match within_deadline(
+        resolve_max_rank(client, config, rank_store, lock_store, clock, quarantine),
+        clock,
+    )
+    .await
+    {
+        Some(cached) => cached,
+        None => {
+            logger::warn!("Classification resolution exceeded total latency budget");
+            None
+        }
+    };
     let rank = cached.as_ref().map(|c| c.rank);
     let disclose = config.disclose_classification_details.unwrap_or(false);
     let ceiling = rank_of(&config.max_allowed_classification).unwrap_or(2);
@@ -1046,12 +1520,20 @@ async fn request_filter<S: DataStorage>(
                     "No classification result available yet for governed columns '{}'; passing through per blockOnUnknownClassification=false",
                     config.governed_column_ids
                 );
-                Flow::Continue(ClassificationGateData::Evaluated { rank: None, status: "unknown" })
+                Flow::Continue(ClassificationGateData::Evaluated {
+                    rank: None,
+                    status: "unknown",
+                })
             }
         }
         Some(rank) if rank > ceiling => {
             let offending: Vec<ColumnRank> = cached
-                .map(|c| c.columns.into_iter().filter(|col| col.rank > ceiling).collect())
+                .map(|c| {
+                    c.columns
+                        .into_iter()
+                        .filter(|col| col.rank > ceiling)
+                        .collect()
+                })
                 .unwrap_or_default();
             logger::warn!(
                 "Blocking request: governed columns '{}' worst-case classification {} exceeds maxAllowedClassification {} (offending: {})",
@@ -1061,20 +1543,61 @@ async fn request_filter<S: DataStorage>(
                 offending.iter().map(|c| format!("{} [{}]", c.name, rank_label(c.rank))).collect::<Vec<_>>().join(", ")
             );
             violations.generate_policy_violation();
-            Flow::Break(build_block_response(protocol, rpc_id, Some(rank), &offending, config))
+            Flow::Break(build_block_response(
+                protocol,
+                rpc_id,
+                Some(rank),
+                &offending,
+                config,
+            ))
         }
-        Some(rank) => Flow::Continue(ClassificationGateData::Evaluated { rank: disclose.then_some(rank), status: "ok" }),
+        Some(rank) => Flow::Continue(ClassificationGateData::Evaluated {
+            rank: disclose.then_some(rank),
+            status: "ok",
+        }),
     }
 }
 
-async fn response_filter(response_state: ResponseState, request_data: RequestData<ClassificationGateData>) {
+async fn response_filter(
+    response_state: ResponseState,
+    request_data: RequestData<ClassificationGateData>,
+) {
     let headers_state = response_state.into_headers_state().await;
 
-    if let RequestData::Continue(ClassificationGateData::Evaluated { rank, status }) = request_data {
+    // Break responses were constructed locally with disclosure already enforced, not upstream.
+    if matches!(request_data, RequestData::Break) {
+        return;
+    }
+    let retained = headers_state
+        .handler()
+        .headers()
+        .into_iter()
+        .filter(|(name, _)| {
+            ![
+                HEADER_CLASSIFICATION_RANK,
+                HEADER_CLASSIFICATION_STATUS,
+                HEADER_CLASSIFICATION_COLUMNS,
+            ]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        })
+        .collect::<Vec<_>>();
+    headers_state.handler().set_headers(
+        retained
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect(),
+    );
+    if let RequestData::Continue(ClassificationGateData::Evaluated { rank, status }) = request_data
+    {
         if let Some(rank) = rank {
-            headers_state.handler().set_header(HEADER_CLASSIFICATION_RANK, rank_label(rank));
+            headers_state
+                .handler()
+                .set_header(HEADER_CLASSIFICATION_RANK, rank_label(rank));
         }
-        headers_state.handler().set_header(HEADER_CLASSIFICATION_STATUS, status);
+        headers_state
+            .handler()
+            .set_header(HEADER_CLASSIFICATION_STATUS, status);
     }
 }
 
@@ -1084,11 +1607,21 @@ async fn launch_policy<S: DataStorage>(
     client: &HttpClient,
     rank_store: &S,
     lock_store: &S,
-    clock: &Clock,
+    clock: &Timer,
     violations: &PolicyViolations,
 ) -> Result<()> {
+    let quarantine = Rc::new(RefCell::new(Quarantine::default()));
     let filter = on_request(|rs| {
-        request_filter(rs, config, client, rank_store, lock_store, clock, violations)
+        request_filter(
+            rs,
+            config,
+            client,
+            rank_store,
+            lock_store,
+            clock,
+            violations,
+            &quarantine,
+        )
     })
     .on_response(response_filter);
     launcher.launch(filter).await?;
@@ -1103,17 +1636,98 @@ async fn configure(
     storage_builder: DataStorageBuilder,
     clock: Clock,
     violations: PolicyViolations,
+    metadata: Metadata,
+    rank_client: HttpClient,
+    lock_client: HttpClient,
 ) -> Result<()> {
     let config = parse_config(&bytes)?;
+    let clock = clock.period(Duration::from_millis(10));
 
     if config.distributed.unwrap_or(false) {
-        let rank_store = storage_builder.remote(RANK_CACHE_NAMESPACE, rank_store_ttl_ms(&config));
-        let lock_store = storage_builder.remote(REFRESH_LOCK_NAMESPACE, REFRESH_LOCK_TTL_MS);
-        launch_policy(launcher, &config, &client, &rank_store, &lock_store, &clock, &violations).await
+        let gateway: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("Invalid gateway storage configuration"))?;
+        let coordinates = gateway.get("sharedStorage");
+        if coordinates
+            .and_then(|s| s.get("baseUrl"))
+            .and_then(Value::as_str)
+            .is_none_or(|v| {
+                !valid_text(v, MAX_TOKEN_BYTES)
+                    || v.parse::<Uri>().ok().is_none_or(|uri| {
+                        uri.authority().is_empty()
+                            || uri.authority().contains('@')
+                            || !matches!(uri.scheme(), "http" | "https")
+                    })
+            })
+            || coordinates
+                .and_then(|s| s.get("service"))
+                .and_then(Value::as_str)
+                .is_none_or(|v| !valid_text(v, MAX_TOKEN_BYTES))
+        {
+            return Err(anyhow!(
+                "Distributed storage requires gateway sharedStorage coordinates"
+            ));
+        }
+        let coordinates =
+            coordinates.ok_or_else(|| anyhow!("Distributed storage coordinates unavailable"))?;
+        let service = Service::new(
+            coordinates["service"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Invalid storage service"))?,
+            coordinates["baseUrl"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Invalid storage URL"))?
+                .parse::<Uri>()
+                .map_err(|_| anyhow!("Invalid storage URL"))?,
+        );
+        let identity = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::json!([
+                    metadata.policy_metadata.policy_namespace,
+                    metadata.policy_metadata.policy_name,
+                    metadata.policy_metadata.filter_name
+                ])
+                .to_string()
+                .as_bytes()
+            )
+        );
+        let rank_namespace = format!("{RANK_CACHE_NAMESPACE}-{identity}");
+        let lock_namespace = format!("{REFRESH_LOCK_NAMESPACE}-{identity}");
+        let rank_store = storage::SafeRemoteDataStorage::new(
+            rank_client,
+            service.clone(),
+            rank_namespace,
+            rank_store_ttl_ms(&config),
+        );
+        let lock_store = storage::SafeRemoteDataStorage::new(
+            lock_client,
+            service,
+            lock_namespace,
+            REFRESH_LOCK_TTL_MS,
+        );
+        launch_policy(
+            launcher,
+            &config,
+            &client,
+            &rank_store,
+            &lock_store,
+            &clock,
+            &violations,
+        )
+        .await
     } else {
         let rank_store = storage_builder.local(RANK_CACHE_NAMESPACE);
         let lock_store = storage_builder.local(REFRESH_LOCK_NAMESPACE);
-        launch_policy(launcher, &config, &client, &rank_store, &lock_store, &clock, &violations).await
+        launch_policy(
+            launcher,
+            &config,
+            &client,
+            &rank_store,
+            &lock_store,
+            &clock,
+            &violations,
+        )
+        .await
     }
 }
 
@@ -1124,7 +1738,10 @@ mod test {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use pdk_unit::{TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
+    use pdk::hl::{EntityState, HeadersState};
+    use pdk_unit::{
+        TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder,
+    };
     use serde_json::{json, Value};
 
     use super::REFRESH_LOCK_TTL_SECONDS;
@@ -1170,6 +1787,7 @@ mod test {
     fn config_with_columns(columns: &[&str], max_allowed: &str) -> String {
         json!({
             "cdgcLoginUrl": "http://cdgclogin",
+            "allowInsecureLocalServices": true,
             "cdgcBaseApiUrl": "http://cdgcapi",
             "cdgcOrgUsername": "test-user",
             "cdgcOrgPassword": "test-pass",
@@ -1205,9 +1823,15 @@ mod test {
             let rendered = format!("{err:#}");
             assert!(rendered.starts_with("configuration: invalid JSON ("));
             assert!(rendered.contains("line ") && rendered.contains("column "));
-            assert!(err.source().is_none(), "raw Serde error must not remain in the error chain");
+            assert!(
+                err.source().is_none(),
+                "raw Serde error must not remain in the error chain"
+            );
             for marker in ["USERNAME_MARKER", "PASSWORD_MARKER", "INVALID_FIELD_MARKER"] {
-                assert!(!rendered.contains(marker), "configuration error leaked {marker}");
+                assert!(
+                    !rendered.contains(marker),
+                    "configuration error leaked {marker}"
+                );
             }
         }
         let input = br#"{"cdgcOrgUsername":"USERNAME_MARKER","cdgcOrgPassword":"PASSWORD_MARKER","timeout": "#;
@@ -1237,15 +1861,31 @@ mod test {
         }
 
         impl FlexAbi for TestAbi {
-            fn get_policy_metadata(&self) -> &PolicyMetadata { panic!("unused metadata") }
-            fn get_configuration(&self) -> &Vec<u8> { &self.config }
-            fn log_trace(&self, _: &str) { panic!("unexpected logging") }
-            fn log_debug(&self, _: &str) { panic!("unexpected logging") }
-            fn log_info(&self, _: &str) { panic!("unexpected logging") }
-            fn log_warn(&self, _: &str) { panic!("unexpected logging") }
-            fn log_error(&self, _: &str) { panic!("unexpected logging") }
+            fn get_policy_metadata(&self) -> &PolicyMetadata {
+                panic!("unused metadata")
+            }
+            fn get_configuration(&self) -> &Vec<u8> {
+                &self.config
+            }
+            fn log_trace(&self, _: &str) {
+                panic!("unexpected logging")
+            }
+            fn log_debug(&self, _: &str) {
+                panic!("unexpected logging")
+            }
+            fn log_info(&self, _: &str) {
+                panic!("unexpected logging")
+            }
+            fn log_warn(&self, _: &str) {
+                panic!("unexpected logging")
+            }
+            fn log_error(&self, _: &str) {
+                panic!("unexpected logging")
+            }
             fn service_create(&self, service: Service) -> Result<(), Status> {
-                self.services.borrow_mut().push(service.uri().authority().to_string());
+                self.services
+                    .borrow_mut()
+                    .push(service.uri().authority().to_string());
                 Ok(())
             }
             fn setup(&self) -> Result<(), Status> {
@@ -1259,7 +1899,8 @@ mod test {
                 "cdgcOrgUsername": "USERNAME_MARKER",
                 "cdgcOrgPassword": "PASSWORD_MARKER",
                 "timeout": "INVALID_FIELD_MARKER",
-            })).into_bytes(),
+            }))
+            .into_bytes(),
             services: RefCell::new(Vec::new()),
             setup_called: RefCell::new(false),
         };
@@ -1347,7 +1988,7 @@ mod test {
                         .to_string(),
                 );
             }
-            if path.contains("segments=summary,dataClassification") {
+            if path.contains("segments=summary,systemAttributes,dataClassification") {
                 *hop1_calls.borrow_mut() += 1;
                 let map = column_map.borrow();
                 let mut arr = Vec::new();
@@ -1356,6 +1997,10 @@ mod test {
                         let mut obj = serde_json::Map::new();
                         obj.insert("core.identity".to_string(), json!(id));
                         obj.insert("summary".to_string(), json!({ "core.name": col_name(id) }));
+                        obj.insert(
+                            "systemAttributes".to_string(),
+                            json!({ "core.classType": super::RELATIONAL_COLUMN_CLASS_TYPE }),
+                        );
                         if !classifications.is_empty() {
                             obj.insert(
                                 "dataClassification".to_string(),
@@ -1409,15 +2054,26 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[PATIENT_ID_COL], "MEDIUM"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(PATIENT_ID_COL, PATIENT_ID_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    PATIENT_ID_COL,
+                    PATIENT_ID_CLS,
+                    "MEDIUM",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -1434,22 +2090,36 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[VISIT_REASON_COL], "MEDIUM"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(42));
 
         assert_eq!(response.status_code(), 200);
-        assert_eq!(response.header("x-classification-gate-status"), Some("blocked"));
+        assert_eq!(
+            response.header("x-classification-gate-status"),
+            Some("blocked")
+        );
         assert_eq!(response.header("content-type"), Some("application/json"));
         assert_eq!(response.header("x-classification-gate-rank"), None);
         let body: Value = serde_json::from_slice(response.body()).unwrap();
@@ -1467,22 +2137,38 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(json!({ "discloseClassificationDetails": true })))
+            .with_config(config_with(
+                json!({ "discloseClassificationDetails": true }),
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "MEDIUM",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(1));
 
         assert_eq!(response.header("x-classification-gate-status"), Some("ok"));
-        assert_eq!(response.header("x-classification-gate-rank"), Some("MEDIUM"));
+        assert_eq!(
+            response.header("x-classification-gate-rank"),
+            Some("MEDIUM")
+        );
     }
 
     #[test]
@@ -1490,23 +2176,42 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(json!({ "discloseClassificationDetails": true })))
+            .with_config(config_with(
+                json!({ "discloseClassificationDetails": true }),
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(3));
 
-        assert_eq!(response.header("x-classification-gate-status"), Some("blocked"));
+        assert_eq!(
+            response.header("x-classification-gate-status"),
+            Some("blocked")
+        );
         assert_eq!(response.header("x-classification-gate-rank"), Some("HIGH"));
-        assert_eq!(response.header("x-classification-gate-columns"), Some("VISIT_REASON"));
+        assert_eq!(
+            response.header("x-classification-gate-columns"),
+            Some("VISIT_REASON")
+        );
         let body: Value = serde_json::from_slice(response.body()).unwrap();
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("HIGH"), "got: {}", msg);
@@ -1524,45 +2229,83 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(json!({ "discloseClassificationDetails": true })))
+            .with_config(config_with(
+                json!({ "discloseClassificationDetails": true }),
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let first = tester.request(mcp_request(1));
         let first_body: Value = serde_json::from_slice(first.body()).unwrap();
-        assert!(first_body["error"]["message"].as_str().unwrap().contains("VISIT_REASON"));
+        assert!(first_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("VISIT_REASON"));
         assert_eq!(*login_calls.borrow(), 1);
 
         let second = tester.request(mcp_request(2));
-        assert_eq!(*login_calls.borrow(), 1, "second request must be served from cache, no fresh CDGC fetch");
-        assert_eq!(second.header("x-classification-gate-columns"), Some("VISIT_REASON"));
+        assert_eq!(
+            *login_calls.borrow(),
+            1,
+            "second request must be served from cache, no fresh CDGC fetch"
+        );
+        assert_eq!(
+            second.header("x-classification-gate-columns"),
+            Some("VISIT_REASON")
+        );
         let second_body: Value = serde_json::from_slice(second.body()).unwrap();
-        assert!(second_body["error"]["message"].as_str().unwrap().contains("VISIT_REASON"));
+        assert!(second_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("VISIT_REASON"));
     }
 
     #[test]
     fn exempt_handshake_methods_pass_through_even_with_high_rank_configured() {
         let login_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_entrypoint(super::configure);
 
-        for method in ["initialize", "tools/list", "notifications/initialized", "ping"] {
+        for method in ["initialize", "tools/list", "ping"] {
             let response = tester.request(mcp_request_with_method(1, method));
-            assert_eq!(response.status_code(), 200, "method {method} should pass through");
-            assert_eq!(response.header("x-classification-gate-status"), Some("skipped"));
+            assert_eq!(
+                response.status_code(),
+                200,
+                "method {method} should pass through"
+            );
+            assert_eq!(
+                response.header("x-classification-gate-status"),
+                Some("skipped")
+            );
         }
 
         assert!(backend.next().is_some());
@@ -1574,15 +2317,26 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "MEDIUM",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -1599,7 +2353,9 @@ mod test {
     #[test]
     fn no_rank_defaults_to_fail_closed_and_emits_violation() {
         let login_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         // No CDGC upstream registered for "cdgcapi" at all -> the Login/JWT succeed but the
         // details fetch has nowhere to go, so fetch_cdgc_max_rank fails and no rank is ever
@@ -1607,33 +2363,51 @@ mod test {
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(11));
 
         let body: Value = serde_json::from_slice(response.body()).unwrap();
         assert_eq!(body["error"]["code"], -32011, "unset flag must fail closed");
-        assert!(backend.next().is_none(), "blocked request must never reach the MCP backend");
-        let violation = response.violation().expect("fail-closed block must emit a PolicyViolation");
+        assert!(
+            backend.next().is_none(),
+            "blocked request must never reach the MCP backend"
+        );
+        let violation = response
+            .violation()
+            .expect("fail-closed block must emit a PolicyViolation");
         assert_eq!(violation.get_policy_name(), "test_policy_id");
     }
 
     #[test]
     fn soft_launch_passes_ungated_when_block_on_unknown_false() {
         let login_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(json!({ "blockOnUnknownClassification": false })))
+            .with_config(config_with(
+                json!({ "blockOnUnknownClassification": false }),
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(12));
 
         assert_eq!(response.status_code(), 200);
-        assert_eq!(response.header("x-classification-gate-status"), Some("unknown"));
+        assert_eq!(
+            response.header("x-classification-gate-status"),
+            Some("unknown")
+        );
         assert!(response.body().is_empty());
         assert!(backend.next().is_some());
         assert!(response.violation().is_none());
@@ -1648,25 +2422,42 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with_columns(&["00000000-0000-0000-0000-000000000000"], "MEDIUM"))
+            .with_config(config_with_columns(
+                &["00000000-0000-0000-0000-000000000000"],
+                "MEDIUM",
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
                 // Registers a real column/classification, but NOT the bogus id the config asks
                 // for -- so the bogus id is simply absent from the mock's response, exactly as a
                 // real nonexistent CDGC asset id would be.
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let response = tester.request(mcp_request(1));
 
         let body: Value = serde_json::from_slice(response.body()).unwrap();
-        assert_eq!(body["error"]["code"], -32011, "an unresolved configured column must fail closed, not pass as unclassified");
+        assert_eq!(
+            body["error"]["code"], -32011,
+            "an unresolved configured column must fail closed, not pass as unclassified"
+        );
         assert!(backend.next().is_none());
     }
 
@@ -1675,7 +2466,9 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut columns = HashMap::new();
         columns.insert(APPOINTMENT_DATE_COL.to_string(), Vec::new()); // present, no classification key
@@ -1684,7 +2477,10 @@ mod test {
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[APPOINTMENT_DATE_COL], "LOW"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
                 cdgc_classification_backend(
@@ -1712,21 +2508,32 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut columns = HashMap::new();
         columns.insert(PATIENT_ID_COL.to_string(), vec![PATIENT_ID_CLS.to_string()]);
         columns.insert(FULL_NAME_COL.to_string(), vec![FULL_NAME_CLS.to_string()]);
-        columns.insert(VISIT_REASON_COL.to_string(), vec![VISIT_REASON_CLS.to_string()]);
+        columns.insert(
+            VISIT_REASON_COL.to_string(),
+            vec![VISIT_REASON_CLS.to_string()],
+        );
         let mut sensitivities: HashMap<String, &'static str> = HashMap::new();
         sensitivities.insert(PATIENT_ID_CLS.to_string(), "MEDIUM");
         sensitivities.insert(FULL_NAME_CLS.to_string(), "MEDIUM");
         sensitivities.insert(VISIT_REASON_CLS.to_string(), "HIGH");
 
         let mut tester = UnitTestBuilder::default()
-            .with_config(config_with_columns(&[PATIENT_ID_COL, FULL_NAME_COL, VISIT_REASON_COL], "MEDIUM"))
+            .with_config(config_with_columns(
+                &[PATIENT_ID_COL, FULL_NAME_COL, VISIT_REASON_COL],
+                "MEDIUM",
+            ))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
                 cdgc_classification_backend(
@@ -1752,7 +2559,9 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let column_ids: Vec<String> = (0..7)
             .map(|i| format!("00000000-0000-0000-0000-00000000000{i}"))
@@ -1767,7 +2576,10 @@ mod test {
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&column_refs, "LOW"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
                 cdgc_classification_backend(
@@ -1783,7 +2595,11 @@ mod test {
 
         assert_eq!(response.status_code(), 200);
         assert_eq!(response.header("x-classification-gate-status"), Some("ok"));
-        assert_eq!(*hop1_calls.borrow(), 2, "7 columns must be chunked into ceil(7/5) = 2 hop-1 calls");
+        assert_eq!(
+            *hop1_calls.borrow(),
+            2,
+            "7 columns must be chunked into ceil(7/5) = 2 hop-1 calls"
+        );
     }
 
     #[test]
@@ -1793,15 +2609,26 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[PATIENT_ID_COL], "MEDIUM"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(PATIENT_ID_COL, PATIENT_ID_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    PATIENT_ID_COL,
+                    PATIENT_ID_CLS,
+                    "MEDIUM",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -1816,7 +2643,9 @@ mod test {
     fn stale_cache_is_served_when_fail_open_true_and_refresh_fails() {
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         // Attempt 1 (first request, cold cache) must succeed end-to-end; attempt 2 (second
         // request, stale cache) must fail on the details fetch so the fail-open path is
@@ -1839,7 +2668,13 @@ mod test {
         };
 
         let attempt_for_details = Rc::clone(&attempt);
-        let inner = single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls));
+        let inner = single_column_backend(
+            VISIT_REASON_COL,
+            VISIT_REASON_CLS,
+            "MEDIUM",
+            Rc::clone(&hop1_calls),
+            Rc::clone(&hop2_calls),
+        );
         let flaky = move |req: UnitHttpRequest| {
             let path = req.header(":path").unwrap_or_default();
             if path.starts_with("/data360/search/v1/assets/details") {
@@ -1866,8 +2701,15 @@ mod test {
 
         let second = tester.request(mcp_request(2));
         assert_eq!(second.status_code(), 200);
-        assert_eq!(second.header("x-classification-gate-status"), Some("ok"), "stale rank must be served on fail-open");
-        assert!(backend.next().is_some(), "fail-open must forward the request to the MCP backend");
+        assert_eq!(
+            second.header("x-classification-gate-status"),
+            Some("ok"),
+            "stale rank must be served on fail-open"
+        );
+        assert!(
+            backend.next().is_some(),
+            "fail-open must forward the request to the MCP backend"
+        );
     }
 
     #[test]
@@ -1875,24 +2717,42 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[VISIT_REASON_COL], "LOW"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
         let response = tester.request(UnitHttpRequest::get().with_path("/mcp"));
 
         assert_eq!(response.status_code(), 200);
-        assert_eq!(response.header("x-classification-gate-status"), Some("skipped"));
+        assert_eq!(
+            response.header("x-classification-gate-status"),
+            Some("skipped")
+        );
         assert!(backend.next().is_some());
-        assert_eq!(*login_calls.borrow(), 0, "resolve_max_rank must not run for a non-POST request");
+        assert_eq!(
+            *login_calls.borrow(),
+            0,
+            "resolve_max_rank must not run for a non-POST request"
+        );
     }
 
     #[test]
@@ -1900,15 +2760,26 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[VISIT_REASON_COL], "LOW"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -1924,15 +2795,26 @@ mod test {
         let login_calls = Rc::new(RefCell::new(0));
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config_with_columns(&[VISIT_REASON_COL], "LOW"))
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "HIGH", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "HIGH",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -1947,18 +2829,26 @@ mod test {
     #[test]
     fn a2a_housekeeping_methods_pass_through_ungated() {
         let login_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
 
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
             .with_backend(Rc::clone(&backend))
-            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&login_calls)))
+            .with_http_upstream_from_authority(
+                "cdgclogin",
+                cdgc_login_backend(Rc::clone(&login_calls)),
+            )
             .with_entrypoint(super::configure);
 
         let response = tester.request(a2a_request(1, "tasks/get"));
 
         assert_eq!(response.status_code(), 200);
-        assert_eq!(response.header("x-classification-gate-status"), Some("skipped"));
+        assert_eq!(
+            response.header("x-classification-gate-status"),
+            Some("skipped")
+        );
         assert_eq!(*login_calls.borrow(), 0);
     }
 
@@ -1975,11 +2865,9 @@ mod test {
 
     #[test]
     fn parse_governed_column_ids_trims_dedupes_and_drops_empties() {
-        let cfg: super::Config = serde_json::from_str(&config_with_columns(
-            &["a", " b ", "a", "", "c"],
-            "MEDIUM",
-        ))
-        .unwrap();
+        let cfg: super::Config =
+            serde_json::from_str(&config_with_columns(&["a", " b ", "a", "", "c"], "MEDIUM"))
+                .unwrap();
         assert_eq!(super::parse_governed_column_ids(&cfg), vec!["a", "b", "c"]);
     }
 
@@ -1990,10 +2878,19 @@ mod test {
         };
         let canonical = cfg(&["a", "b"]);
         for variant in [cfg(&["b", "a"]), cfg(&[" a ", "b", "a"])] {
-            assert_eq!(super::rank_cache_key(&variant), super::rank_cache_key(&canonical));
-            assert_eq!(super::refresh_lock_key(&variant), super::refresh_lock_key(&canonical));
+            assert_eq!(
+                super::rank_cache_key(&variant),
+                super::rank_cache_key(&canonical)
+            );
+            assert_eq!(
+                super::refresh_lock_key(&variant),
+                super::refresh_lock_key(&canonical)
+            );
         }
-        assert_ne!(super::rank_cache_key(&cfg(&["a", "c"])), super::rank_cache_key(&canonical));
+        assert_ne!(
+            super::rank_cache_key(&cfg(&["a", "c"])),
+            super::rank_cache_key(&canonical)
+        );
     }
 
     #[test]
@@ -2002,7 +2899,11 @@ mod test {
         let jwt_cookie = Rc::new(RefCell::new(String::new()));
         let jwt_ids = Rc::new(RefCell::new(String::new()));
 
-        let (path_c, cookie_c, ids_c) = (Rc::clone(&jwt_path), Rc::clone(&jwt_cookie), Rc::clone(&jwt_ids));
+        let (path_c, cookie_c, ids_c) = (
+            Rc::clone(&jwt_path),
+            Rc::clone(&jwt_cookie),
+            Rc::clone(&jwt_ids),
+        );
         let capturing_login = move |req: UnitHttpRequest| {
             let path = req.header(":path").unwrap_or_default();
             if path.starts_with("/identity-service/api/v1/Login") {
@@ -2020,14 +2921,22 @@ mod test {
 
         let hop1_calls = Rc::new(RefCell::new(0));
         let hop2_calls = Rc::new(RefCell::new(0));
-        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| UnitHttpResponse::new(200)));
+        let backend = Rc::new(TraceBackend::new(|_req: UnitHttpRequest| {
+            UnitHttpResponse::new(200)
+        }));
         let mut tester = UnitTestBuilder::default()
             .with_config(config())
             .with_backend(Rc::clone(&backend))
             .with_http_upstream_from_authority("cdgclogin", capturing_login)
             .with_http_upstream_from_authority(
                 "cdgcapi",
-                single_column_backend(VISIT_REASON_COL, VISIT_REASON_CLS, "MEDIUM", Rc::clone(&hop1_calls), Rc::clone(&hop2_calls)),
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "MEDIUM",
+                    Rc::clone(&hop1_calls),
+                    Rc::clone(&hop2_calls),
+                ),
             )
             .with_entrypoint(super::configure);
 
@@ -2037,7 +2946,10 @@ mod test {
         assert_eq!(*jwt_cookie.borrow(), "USER_SESSION=session-1");
         assert_eq!(*jwt_ids.borrow(), "session-1");
         let path = jwt_path.borrow();
-        assert!(path.contains("client_id=idmc_api"), "jwt path missing client_id: {path}");
+        assert!(
+            path.contains("client_id=idmc_api"),
+            "jwt path missing client_id: {path}"
+        );
         assert!(path.contains("nonce="), "jwt path missing nonce: {path}");
     }
 
@@ -2045,5 +2957,1235 @@ mod test {
     #[allow(unused)]
     fn silence_unused_lock_ttl_import() {
         let _ = REFRESH_LOCK_TTL_SECONDS;
+    }
+
+    #[test]
+    fn semantic_configuration_bounds_and_https_are_enforced() {
+        for overrides in [
+            json!({"timeout": 0}),
+            json!({"timeout": 10001}),
+            json!({"refreshIntervalSeconds": 29}),
+            json!({"maxAllowedClassification": "INVALID"}),
+            json!({"governedColumnIds": ", ,"}),
+            json!({"governedColumnIds": "x".repeat(257)}),
+            json!({"governedColumnIds": (0..33).map(|i| i.to_string()).collect::<Vec<_>>().join(",")}),
+            json!({"allowInsecureLocalServices": false}),
+            json!({"cdgcOrgUsername": "u\r\nx"}),
+        ] {
+            assert!(super::parse_config(config_with(overrides).as_bytes()).is_err());
+        }
+        assert!(super::parse_config(
+            config_with(json!({"allowInsecureLocalServices": false,
+            "cdgcLoginUrl": "https://login", "cdgcBaseApiUrl": "https://api"}))
+            .as_bytes()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn protocol_camouflage_missing_ids_batches_depth_and_media_types() {
+        let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        for body in [
+            "{".to_string(),
+            "[]".to_string(),
+            "null".to_string(),
+            json!({"jsonrpc":"2.0","method":"tools/call"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"message/send"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"tools/call","id":{}}).to_string(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":1}).to_string(),
+            format!("{}0{}", "[".repeat(130), "]".repeat(130)),
+        ] {
+            let response = tester.request(
+                UnitHttpRequest::post()
+                    .with_path("/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_body(body),
+            );
+            assert_eq!(response.status_code(), 400);
+            assert!(backend.next().is_none());
+        }
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_path("/v1/message:send")
+                .with_header("content-type", "Application/A2A+JSON; charset=utf-8")
+                .with_body(json!({"jsonrpc":"2.0","method":"initialize","id":1}).to_string()),
+        );
+        assert_eq!(
+            response.status_code(),
+            403,
+            "REST must win over exempt RPC camouflage"
+        );
+        assert!(backend.next().is_none());
+        let response = tester.request(
+            a2a_request(7, "SendMessage").with_header("content-type", "application/a2a+json"),
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(response.body()).unwrap()["error"]["code"],
+            -32012
+        );
+        assert!(backend.next().is_none());
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_path("/mcp")
+                .with_header("content-type", "application/json")
+                .with_body(
+                    json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+                ),
+        );
+        assert_eq!(
+            response.header(super::HEADER_CLASSIFICATION_STATUS),
+            Some("skipped")
+        );
+        assert!(backend.next().is_some());
+        for content_type in ["application/grpc", "text/application/json"] {
+            let response = tester.request(
+                UnitHttpRequest::post()
+                    .with_path("/mcp")
+                    .with_header("content-type", content_type)
+                    .with_body("{}"),
+            );
+            assert_eq!(
+                response.header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("skipped")
+            );
+            assert!(backend.next().is_some());
+        }
+    }
+
+    #[test]
+    fn declared_and_actual_request_limits_fail_before_upstream() {
+        let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        for length in ["1048577", "184467440737095516160", "invalid"] {
+            assert_eq!(
+                tester
+                    .request(mcp_request(1).with_header("content-length", length))
+                    .status_code(),
+                413
+            );
+        }
+        assert_eq!(
+            tester
+                .request(mcp_request(1).with_body(" ".repeat(super::MAX_REQUEST_BYTES + 1)))
+                .status_code(),
+            413
+        );
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn upstream_reserved_headers_are_removed_even_on_skipped_requests() {
+        for disclose in [false, true] {
+            let backend = Rc::new(TraceBackend::new(|_| {
+                UnitHttpResponse::new(200)
+                    .with_header("X-Classification-Gate-Rank", "HIGH")
+                    .with_header("X-Classification-Gate-Columns", "SECRET")
+                    .with_header("X-Classification-Gate-Status", "forged")
+            }));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config_with(
+                    json!({"discloseClassificationDetails":disclose}),
+                ))
+                .with_backend(backend)
+                .with_entrypoint(super::configure);
+            let response = tester.request(UnitHttpRequest::get());
+            assert_eq!(
+                response.header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("skipped")
+            );
+            assert_eq!(response.header(super::HEADER_CLASSIFICATION_RANK), None);
+            assert_eq!(response.header(super::HEADER_CLASSIFICATION_COLUMNS), None);
+        }
+    }
+
+    #[test]
+    fn named_non_column_or_missing_class_type_never_becomes_unclassified_or_stale_allow() {
+        for class_type in [
+            None,
+            Some("com.infa.odin.models.relational.Table"),
+            Some("com.infa.odin.models.relational.ViewColumn"),
+            Some("Column"),
+            Some(""),
+        ] {
+            let bad = Rc::new(RefCell::new(false));
+            let flag = Rc::clone(&bad);
+            let hop2_calls = Rc::new(RefCell::new(0));
+            let hop2_counter = Rc::clone(&hop2_calls);
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default().with_config(config()).with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority("cdgclogin",cdgc_login_backend(Rc::new(RefCell::new(0))))
+                .with_http_upstream_from_authority("cdgcapi",move |req:UnitHttpRequest| {
+                    let path = req.header(":path").unwrap_or_default();
+                    if path.contains("selfAttributes") { *hop2_counter.borrow_mut() += 1; }
+                    let mut entry = json!({"core.identity":VISIT_REASON_COL,"summary":{"core.name":"NAMED_ASSET"}});
+                    let discriminator = if *flag.borrow() { class_type } else { Some("com.infa.odin.models.relational.Column") };
+                    if let Some(value) = discriminator { entry["systemAttributes"] = json!({"core.classType":value}); }
+                    UnitHttpResponse::new(200).with_body(json!([entry]).to_string())
+                }).with_entrypoint(super::configure);
+            let allowed = tester.request(mcp_request(1));
+            assert_eq!(
+                allowed.header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("ok")
+            );
+            assert!(
+                backend.next().is_some(),
+                "validated Column without classifications remains allowed"
+            );
+            *bad.borrow_mut() = true;
+            tester.sleep(Duration::from_secs(86401));
+            for id in [2, 3] {
+                let response = tester.request(mcp_request(id));
+                assert_eq!(response.header(super::HEADER_CLASSIFICATION_STATUS),Some("blocked"),
+                    "invalid class type {class_type:?} must not become unclassified or reuse stale cache");
+                assert!(backend.next().is_none());
+            }
+            assert_eq!(*hop2_calls.borrow(), 0);
+        }
+    }
+
+    #[test]
+    fn integrity_failures_never_reuse_stale_rank_including_the_next_request() {
+        let mut bad_entries = [
+            json!([{ "core.identity": VISIT_REASON_COL }]),
+            json!([{ "core.identity": VISIT_REASON_COL, "summary":{"core.name":""} }]),
+            json!([{ "core.identity": VISIT_REASON_COL, "summary":{"core.name":"name\r\nx"} }]),
+            json!([{ "core.identity": VISIT_REASON_COL, "summary":{"core.name":"x".repeat(129)} }]),
+            json!([{ "core.identity": VISIT_REASON_COL, "summary":{"core.name":"VALID"},
+                "dataClassification":[{"core.identity":"x".repeat(257)}] }]),
+            json!([{ "core.identity": VISIT_REASON_COL, "summary":{"core.name":"VALID"},
+                "dataClassification":(0..33).map(|i| json!({"core.identity":i.to_string()})).collect::<Vec<_>>() }]),
+            json!([{}, {}]),
+            json!([]),
+            json!([{ "core.identity": "WRONG" }]),
+            json!([{ "core.identity": VISIT_REASON_COL }, { "core.identity": VISIT_REASON_COL }]),
+        ];
+        // Preserve each bounds/name regression's intended cause after adding the type guard.
+        for batch in &mut bad_entries {
+            for entry in batch.as_array_mut().unwrap() {
+                entry["systemAttributes"] =
+                    json!({"core.classType":super::RELATIONAL_COLUMN_CLASS_TYPE});
+            }
+        }
+        for bad in bad_entries
+            .into_iter()
+            .map(|v| v.to_string())
+            .chain(["{".to_string()])
+        {
+            let invalid = Rc::new(RefCell::new(false));
+            let invalid_backend = Rc::clone(&invalid);
+            let good = single_column_backend(
+                VISIT_REASON_COL,
+                VISIT_REASON_CLS,
+                "LOW",
+                Rc::new(RefCell::new(0)),
+                Rc::new(RefCell::new(0)),
+            );
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config())
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority(
+                    "cdgclogin",
+                    cdgc_login_backend(Rc::new(RefCell::new(0))),
+                )
+                .with_http_upstream_from_authority("cdgcapi", move |req| {
+                    if *invalid_backend.borrow() {
+                        UnitHttpResponse::new(200).with_body(bad.clone())
+                    } else {
+                        good(req)
+                    }
+                })
+                .with_entrypoint(super::configure);
+            assert_eq!(
+                tester
+                    .request(mcp_request(1))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("ok")
+            );
+            assert!(backend.next().is_some());
+            *invalid.borrow_mut() = true;
+            tester.sleep(Duration::from_secs(86401));
+            for id in [2, 3] {
+                let response = tester.request(mcp_request(id));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(response.body()).unwrap()["error"]["code"],
+                    -32011
+                );
+                assert!(backend.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_unknown_and_duplicate_sensitivities_are_integrity_failures() {
+        for bad in [
+            json!([{ "core.identity":VISIT_REASON_CLS }]),
+            json!([{ "core.identity":VISIT_REASON_CLS, "selfAttributes":{"core.sensitivity":"SECRET_UNKNOWN"} }]),
+            json!([{ "core.identity":VISIT_REASON_CLS }, { "core.identity":VISIT_REASON_CLS }]),
+        ] {
+            let invalid = Rc::new(RefCell::new(false));
+            let flag = Rc::clone(&invalid);
+            let good = single_column_backend(
+                VISIT_REASON_COL,
+                VISIT_REASON_CLS,
+                "LOW",
+                Rc::new(RefCell::new(0)),
+                Rc::new(RefCell::new(0)),
+            );
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config())
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority(
+                    "cdgclogin",
+                    cdgc_login_backend(Rc::new(RefCell::new(0))),
+                )
+                .with_http_upstream_from_authority("cdgcapi", move |req: UnitHttpRequest| {
+                    if *flag.borrow()
+                        && req
+                            .header(":path")
+                            .unwrap_or_default()
+                            .contains("selfAttributes")
+                    {
+                        UnitHttpResponse::new(200).with_body(bad.to_string())
+                    } else {
+                        good(req)
+                    }
+                })
+                .with_entrypoint(super::configure);
+            assert_eq!(
+                tester
+                    .request(mcp_request(1))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("ok")
+            );
+            assert!(backend.next().is_some());
+            *invalid.borrow_mut() = true;
+            tester.sleep(Duration::from_secs(86401));
+            for id in [2, 3] {
+                assert!(
+                    serde_json::from_slice::<Value>(tester.request(mcp_request(id)).body())
+                        .unwrap()
+                        .get("error")
+                        .is_some()
+                );
+                assert!(backend.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn response_extractor_checks_size_and_status_without_copying() {
+        for (size, status) in [(super::MAX_RESPONSE_BYTES + 1, 200), (100, 500)] {
+            assert!(
+                super::bounded_response(size, status, || panic!("must not copy body")).is_err()
+            );
+        }
+        let err = super::cdgc_json::<super::CdgcLoginResponse>(
+            br#"{"sessionId":{"SECRET":"TOKEN"},"orgId":"ORG"}"#,
+            "CDGC Login",
+        )
+        .err()
+        .unwrap();
+        assert!(err.downcast_ref::<super::IntegrityFailure>().is_some());
+        assert!(!format!("{err:#}").contains("SECRET"));
+        assert!(!format!("{err:#}").contains("TOKEN"));
+        assert!(super::bounded_response(2, 200, || Some(vec![0])).is_err());
+    }
+
+    #[test]
+    fn error_info_metadata_is_a_string_map() {
+        let config = super::parse_config(config().as_bytes()).unwrap();
+        let info = super::a2a_error_info(
+            true,
+            Some(3),
+            &[super::ColumnRank {
+                name: "NAME".to_string(),
+                rank: 3,
+            }],
+            &config,
+        );
+        assert!(info["metadata"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(Value::is_string));
+    }
+
+    #[test]
+    fn explicit_rest_controls_skip_even_empty_or_malformed_bodies() {
+        let calls = Rc::new(RefCell::new(0));
+        let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&calls)))
+            .with_entrypoint(super::configure);
+        for path in [
+            "/tasks/task:cancel",
+            "/v1/tasks/task:subscribe?x=1",
+            "/v1/tasks/task/pushNotificationConfigs",
+        ] {
+            for body in ["", "{", "{}"] {
+                let response = tester.request(
+                    UnitHttpRequest::post()
+                        .with_path(path)
+                        .with_header("content-type", "application/a2a+json")
+                        .with_body(body),
+                );
+                assert_eq!(
+                    response.header(super::HEADER_CLASSIFICATION_STATUS),
+                    Some("skipped")
+                );
+                assert!(backend.next().is_some());
+            }
+        }
+        for path in [
+            "/message:send",
+            "/tasks/:cancel",
+            "/tasks/task:cancel/extra",
+            "/tasks/task/pushNotificationConfigs/extra",
+        ] {
+            let response = tester.request(
+                UnitHttpRequest::post()
+                    .with_path(path)
+                    .with_header("content-type", "application/json")
+                    .with_body(""),
+            );
+            assert_eq!(response.status_code(), 400);
+            assert!(backend.next().is_none());
+        }
+        assert_eq!(*calls.borrow(), 0);
+    }
+
+    struct MockStorage {
+        data: RefCell<HashMap<String, (Vec<u8>, u64)>>,
+        fail: bool,
+        conflict: bool,
+        write_fail: bool,
+        reads: std::cell::Cell<u64>,
+        replace_on_read: RefCell<HashMap<u64, super::CachedRank>>,
+    }
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                data: RefCell::new(HashMap::new()),
+                fail: false,
+                conflict: false,
+                write_fail: false,
+                reads: std::cell::Cell::new(0),
+                replace_on_read: RefCell::new(HashMap::new()),
+            }
+        }
+    }
+    impl pdk::data_storage::DataStorage for MockStorage {
+        async fn get_keys(&self) -> Result<Vec<String>, pdk::data_storage::DataStorageError> {
+            Ok(Vec::new())
+        }
+        async fn store<T: serde::Serialize>(
+            &self,
+            key: &str,
+            mode: &pdk::data_storage::StoreMode,
+            value: &T,
+        ) -> Result<(), pdk::data_storage::DataStorageError> {
+            use pdk::data_storage::{DataStorageError, StoreMode};
+            if self.fail || self.write_fail {
+                return Err(DataStorageError::Unexpected("error".to_string()));
+            }
+            if self.conflict {
+                return Err(DataStorageError::CasMismatch);
+            }
+            let mut data = self.data.borrow_mut();
+            let version = data.get(key).map(|(_, v)| *v);
+            match mode {
+                StoreMode::Absent if version.is_some() => {
+                    return Err(DataStorageError::CasMismatch)
+                }
+                StoreMode::Cas(v) if v.parse::<u64>().ok() != version => {
+                    return Err(DataStorageError::CasMismatch)
+                }
+                _ => (),
+            }
+            data.insert(
+                key.to_string(),
+                (serde_json::to_vec(value).unwrap(), version.unwrap_or(0) + 1),
+            );
+            Ok(())
+        }
+        async fn get<T: serde::de::DeserializeOwned>(
+            &self,
+            key: &str,
+        ) -> Result<Option<(T, String)>, pdk::data_storage::DataStorageError> {
+            if self.fail {
+                return Err(pdk::data_storage::DataStorageError::Unexpected(
+                    "error".to_string(),
+                ));
+            }
+            self.reads.set(self.reads.get() + 1);
+            if let Some(value) = self.replace_on_read.borrow_mut().remove(&self.reads.get()) {
+                self.data
+                    .borrow_mut()
+                    .insert(key.to_string(), (serde_json::to_vec(&value).unwrap(), 99));
+            }
+            Ok(self
+                .data
+                .borrow()
+                .get(key)
+                .map(|(bytes, v)| (serde_json::from_slice(bytes).unwrap(), v.to_string())))
+        }
+        async fn delete(&self, _: &str) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("never delete")
+        }
+        async fn delete_all(&self) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("never delete")
+        }
+    }
+    fn ready<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let waker = std::task::Waker::noop();
+        match future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(waker))
+        {
+            std::task::Poll::Ready(value) => value,
+            _ => panic!("mock must be ready"),
+        }
+    }
+    fn cached(rank: u8, timestamp: i64) -> super::CachedRank {
+        super::CachedRank {
+            rank,
+            timestamp,
+            columns: vec![super::ColumnRank {
+                name: "NAME".to_string(),
+                rank,
+            }],
+            integrity_failed: false,
+        }
+    }
+
+    #[test]
+    fn cas_older_equal_observations_return_the_validated_winner_and_errors_are_unknown() {
+        let store = MockStorage::new();
+        assert_eq!(
+            ready(super::write_cached_rank(
+                &store,
+                "key",
+                &cached(3, 20),
+                || Some(30)
+            ))
+            .unwrap()
+            .rank,
+            3
+        );
+        for timestamp in [10, 20] {
+            assert_eq!(
+                ready(super::write_cached_rank(
+                    &store,
+                    "key",
+                    &cached(1, timestamp),
+                    || Some(30)
+                ))
+                .unwrap()
+                .rank,
+                3
+            );
+        }
+        assert_eq!(
+            ready(super::write_cached_rank(
+                &store,
+                "key",
+                &cached(2, 21),
+                || Some(30)
+            ))
+            .unwrap()
+            .rank,
+            2
+        );
+        let mut invalid = cached(0, 100);
+        store.data.borrow_mut().insert(
+            "key".to_string(),
+            (serde_json::to_vec(&invalid).unwrap(), 99),
+        );
+        assert_eq!(
+            ready(super::write_cached_rank(
+                &store,
+                "key",
+                &cached(1, 22),
+                || Some(30)
+            ))
+            .unwrap()
+            .rank,
+            1
+        );
+        invalid.timestamp = 25;
+        invalid.rank = 9;
+        store.data.borrow_mut().insert(
+            "key".to_string(),
+            (serde_json::to_vec(&invalid).unwrap(), 99),
+        );
+        assert_eq!(
+            ready(super::write_cached_rank(
+                &store,
+                "key",
+                &cached(1, 22),
+                || Some(30)
+            ))
+            .unwrap()
+            .rank,
+            1
+        );
+        for store in [
+            MockStorage {
+                fail: true,
+                ..MockStorage::new()
+            },
+            MockStorage {
+                conflict: true,
+                ..MockStorage::new()
+            },
+        ] {
+            assert!(ready(super::write_cached_rank(
+                &store,
+                "key",
+                &cached(1, 22),
+                || Some(30)
+            ))
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn cache_validation_rejects_inconsistent_ranks_columns_names_and_timestamps() {
+        for value in [cached(1, -1), cached(1, i64::MAX), cached(4, 0)] {
+            assert!(!super::valid_cached_rank(&value, 30, 1));
+        }
+        let mut value = cached(1, 1);
+        assert!(!super::valid_cached_rank(&value, 30, 2));
+        value.columns[0].rank = 0;
+        assert!(!super::valid_cached_rank(&value, 30, 1));
+        value.columns[0].rank = 1;
+        value.columns[0].name = "bad\r\nname".to_string();
+        assert!(!super::valid_cached_rank(&value, 30, 1));
+        assert!(super::observation_timestamp(
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn cache_identity_is_opaque_and_isolates_sources_accounts_and_column_sets() {
+        let base = super::parse_config(config().as_bytes()).unwrap();
+        let key = super::rank_cache_key(&base);
+        assert!(!key.contains(VISIT_REASON_COL) && !key.contains("test-user"));
+        for override_value in [
+            json!({"cdgcOrgUsername":"other"}),
+            json!({"cdgcLoginUrl":"https://other"}),
+            json!({"cdgcBaseApiUrl":"https://other"}),
+            json!({"governedColumnIds":"other"}),
+        ] {
+            assert_ne!(
+                key,
+                super::rank_cache_key(
+                    &super::parse_config(config_with(override_value).as_bytes()).unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_lock_future_overflow_and_contention_are_safe() {
+        let store = MockStorage::new();
+        assert!(ready(super::try_acquire_refresh_lock(&store, "key", 100)).unwrap());
+        assert!(!ready(super::try_acquire_refresh_lock(&store, "key", 101)).unwrap());
+        assert!(ready(super::try_acquire_refresh_lock(&store, "key", 131)).unwrap());
+        let value = super::RefreshLock {
+            acquired_at: i64::MAX,
+        };
+        store
+            .data
+            .borrow_mut()
+            .insert("key".to_string(), (serde_json::to_vec(&value).unwrap(), 1));
+        assert!(!ready(super::try_acquire_refresh_lock(&store, "key", 1)).unwrap());
+    }
+
+    #[test]
+    fn local_mode_works_without_anypoint() {
+        let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .local_mode()
+            .with_config(config())
+            .with_backend(backend)
+            .with_entrypoint(super::configure);
+        assert_eq!(tester.request(UnitHttpRequest::get()).status_code(), 200);
+    }
+
+    #[test]
+    fn distributed_missing_coordinates_fails_before_remote_storage() {
+        for coordinates in [
+            Value::Null,
+            json!({"baseUrl":"","service":"x"}),
+            json!({"baseUrl":"not-a-url","service":"x"}),
+            json!({"baseUrl":"http://localhost:4000","service":""}),
+        ] {
+            let mut input: Value =
+                serde_json::from_str(&config_with(json!({"distributed":true}))).unwrap();
+            input["sharedStorage"] = coordinates;
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(input.to_string())
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            assert_eq!(tester.request(mcp_request(1)).status_code(), 503);
+            assert!(backend.next().is_none());
+        }
+    }
+
+    async fn configure_mock_storage(
+        launcher: pdk::hl::Launcher,
+        pdk::hl::Configuration(bytes): pdk::hl::Configuration,
+        client: pdk::hl::HttpClient,
+        clock: pdk::hl::timer::Clock,
+        violations: pdk::policy_violation::PolicyViolations,
+    ) -> anyhow::Result<()> {
+        let config = super::parse_config(&bytes)?;
+        let input: Value = serde_json::from_slice(&bytes)?;
+        let rank_store = MockStorage {
+            fail: input["storageFailure"].as_bool().unwrap_or(false),
+            ..MockStorage::new()
+        };
+        let lock_store = MockStorage::new();
+        // Seed an old allow rank and a fresh lock to reproduce strict contention without HTTP.
+        rank_store.data.borrow_mut().insert(
+            super::rank_cache_key(&config),
+            (serde_json::to_vec(&cached(1, 0))?, 1),
+        );
+        lock_store.data.borrow_mut().insert(
+            super::refresh_lock_key(&config),
+            (
+                serde_json::to_vec(&super::RefreshLock { acquired_at: 31 })?,
+                1,
+            ),
+        );
+        let timer = clock.period(Duration::from_millis(10));
+        super::launch_policy(
+            launcher,
+            &config,
+            &client,
+            &rank_store,
+            &lock_store,
+            &timer,
+            &violations,
+        )
+        .await
+    }
+
+    #[test]
+    fn strict_stale_contention_and_storage_errors_never_serve_allow_cache() {
+        for (fail_open, storage_failure) in [(false, false), (false, true), (true, false)] {
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default().with_config(config_with(json!({
+                "refreshIntervalSeconds":30,"failOpenOnCdgcError":fail_open,"storageFailure":storage_failure})))
+                .with_backend(Rc::clone(&backend)).with_entrypoint(configure_mock_storage);
+            tester.sleep(Duration::from_secs(31));
+            let response = tester.request(mcp_request(1));
+            assert_eq!(
+                response.header(super::HEADER_CLASSIFICATION_STATUS),
+                Some(if fail_open { "ok" } else { "blocked" })
+            );
+            assert_eq!(backend.next().is_some(), fail_open);
+        }
+    }
+
+    async fn configure_cache_scenario(
+        launcher: pdk::hl::Launcher,
+        pdk::hl::Configuration(bytes): pdk::hl::Configuration,
+        client: pdk::hl::HttpClient,
+        clock: pdk::hl::timer::Clock,
+        violations: pdk::policy_violation::PolicyViolations,
+    ) -> anyhow::Result<()> {
+        let config = super::parse_config(&bytes)?;
+        let input: Value = serde_json::from_slice(&bytes)?;
+        let scenario = input["cacheScenario"].as_str().unwrap();
+        let rank_store = MockStorage {
+            write_fail: scenario == "write-failure",
+            ..MockStorage::new()
+        };
+        let lock_store = MockStorage::new();
+        let seed = if scenario == "invalid" {
+            cached(1, i64::MAX)
+        } else {
+            cached(1, 0)
+        };
+        rank_store.data.borrow_mut().insert(
+            super::rank_cache_key(&config),
+            (serde_json::to_vec(&seed)?, 1),
+        );
+        if scenario == "high-winner" || scenario == "invalid-winner" || scenario == "high-transient"
+        {
+            let mut winner = cached(3, 31_000_000_000);
+            winner.integrity_failed = scenario == "invalid-winner";
+            rank_store.replace_on_read.borrow_mut().insert(2, winner);
+            if scenario != "high-transient" {
+                lock_store.data.borrow_mut().insert(
+                    super::refresh_lock_key(&config),
+                    (
+                        serde_json::to_vec(&super::RefreshLock { acquired_at: 31 })?,
+                        1,
+                    ),
+                );
+            }
+        }
+        let timer = clock.period(Duration::from_millis(10));
+        super::launch_policy(
+            launcher,
+            &config,
+            &client,
+            &rank_store,
+            &lock_store,
+            &timer,
+            &violations,
+        )
+        .await
+    }
+
+    #[test]
+    fn fallback_rereads_concurrent_high_and_invalidation_winners() {
+        for scenario in ["high-winner", "invalid-winner", "high-transient"] {
+            let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config_with(json!({
+                "cacheScenario":scenario,"refreshIntervalSeconds":30})))
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority("cdgclogin", |_| UnitHttpResponse::new(503))
+                .with_entrypoint(configure_cache_scenario);
+            tester.sleep(Duration::from_secs(31));
+            assert_eq!(
+                tester
+                    .request(mcp_request(1))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("blocked")
+            );
+            assert!(backend.next().is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_future_cache_is_refreshed_and_replaced() {
+        let calls = Rc::new(RefCell::new(0));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({"cacheScenario":"invalid"})))
+            .with_http_upstream_from_authority("cdgclogin", cdgc_login_backend(Rc::clone(&calls)))
+            .with_http_upstream_from_authority(
+                "cdgcapi",
+                single_column_backend(
+                    VISIT_REASON_COL,
+                    VISIT_REASON_CLS,
+                    "LOW",
+                    Rc::new(RefCell::new(0)),
+                    Rc::new(RefCell::new(0)),
+                ),
+            )
+            .with_entrypoint(configure_cache_scenario);
+        for id in [1, 2] {
+            assert_eq!(
+                tester
+                    .request(mcp_request(id))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("ok")
+            );
+        }
+        assert_eq!(*calls.borrow(), 1, "replaced cache must be reusable");
+    }
+
+    #[test]
+    fn integrity_write_failure_quarantines_old_allow_across_requests() {
+        let calls = Rc::new(RefCell::new(0));
+        let observed = Rc::clone(&calls);
+        let backend = Rc::new(TraceBackend::new(UnitHttpResponse::new(200)));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(json!({
+            "cacheScenario":"write-failure","refreshIntervalSeconds":30})))
+            .with_backend(Rc::clone(&backend))
+            .with_http_upstream_from_authority("cdgclogin", move |_| {
+                *observed.borrow_mut() += 1;
+                UnitHttpResponse::new(200).with_body("{}")
+            })
+            .with_entrypoint(configure_cache_scenario);
+        tester.sleep(Duration::from_secs(31));
+        for id in [1, 2] {
+            assert_eq!(
+                tester
+                    .request(mcp_request(id))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("blocked")
+            );
+            assert!(backend.next().is_none());
+        }
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "second request contends on lock but cannot reuse LOW"
+        );
+    }
+
+    async fn configure_quarantine_cancellation(
+        launcher: pdk::hl::Launcher,
+        clock: pdk::hl::timer::Clock,
+    ) -> anyhow::Result<()> {
+        let timer = clock.period(Duration::from_millis(10));
+        let quarantine = RefCell::new(super::Quarantine::default());
+        let pending = PendingStorage {
+            stage: 2,
+            reads: std::cell::Cell::new(0),
+        };
+        let store = MockStorage::new();
+        store
+            .data
+            .borrow_mut()
+            .insert("key".into(), (serde_json::to_vec(&cached(1, 0))?, 1));
+        launcher
+            .launch(pdk::hl::on_request(
+                |request: pdk::hl::RequestState| async {
+                    let headers = request.into_headers_state().await;
+                    if headers.handler().header("cancel").is_some() {
+                        assert!(super::within_deadline(
+                            super::invalidate_rank(&pending, "key", 0, 1, &timer, &quarantine),
+                            &timer
+                        )
+                        .await
+                        .is_none());
+                    }
+                    assert!(quarantine.borrow().timestamp.is_some());
+                    assert!(super::fallback_rank(&store, "key", &timer, 1, &quarantine)
+                        .await
+                        .is_none());
+                    pdk::hl::Flow::<()>::Break(pdk::hl::Response::new(403))
+                },
+            ))
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_of_invalidation_preserves_local_quarantine() {
+        let mut tester =
+            UnitTestBuilder::default().with_entrypoint(configure_quarantine_cancellation);
+        let mut first =
+            tester.request_partial(UnitHttpRequest::get().with_header("cancel", "true"));
+        assert!(matches!(first.poll(), std::task::Poll::Pending));
+        tester.sleep(Duration::from_millis(10_010));
+        assert!(
+            matches!(first.poll(),std::task::Poll::Ready(response) if response.status_code() == 403)
+        );
+        assert_eq!(tester.request(UnitHttpRequest::get()).status_code(), 403);
+    }
+
+    struct DelayedCache<'a> {
+        timer: &'a pdk::hl::timer::Timer,
+    }
+    impl pdk::data_storage::DataStorage for DelayedCache<'_> {
+        async fn get_keys(&self) -> Result<Vec<String>, pdk::data_storage::DataStorageError> {
+            panic!("unused")
+        }
+        async fn store<T: serde::Serialize>(
+            &self,
+            _: &str,
+            _: &pdk::data_storage::StoreMode,
+            _: &T,
+        ) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("fresh cache needs no writes")
+        }
+        async fn get<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &str,
+        ) -> Result<Option<(T, String)>, pdk::data_storage::DataStorageError> {
+            self.timer.sleep(Duration::from_secs(1)).await;
+            let value = serde_json::from_value(json!({"rank":1,"timestamp":1_000_000_000_i64,
+                "columns":[{"name":"NAME","rank":1}],"integrity_failed":false}))
+            .unwrap();
+            Ok(Some((value, "1".into())))
+        }
+        async fn delete(&self, _: &str) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("unused")
+        }
+        async fn delete_all(&self) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("unused")
+        }
+    }
+
+    async fn configure_delayed_cache(
+        launcher: pdk::hl::Launcher,
+        pdk::hl::Configuration(bytes): pdk::hl::Configuration,
+        client: pdk::hl::HttpClient,
+        clock: pdk::hl::timer::Clock,
+    ) -> anyhow::Result<()> {
+        let config = super::parse_config(&bytes)?;
+        let timer = clock.period(Duration::from_millis(10));
+        let store = DelayedCache { timer: &timer };
+        let quarantine = RefCell::new(super::Quarantine::default());
+        launcher
+            .launch(pdk::hl::on_request(
+                |request: pdk::hl::RequestState| async {
+                    let _ = request.into_headers_state().await;
+                    let winner = super::resolve_max_rank(
+                        &client,
+                        &config,
+                        &store,
+                        &store,
+                        &timer,
+                        &quarantine,
+                    )
+                    .await;
+                    assert_eq!(winner.unwrap().rank, 1);
+                    pdk::hl::Flow::<()>::Break(pdk::hl::Response::new(200))
+                },
+            ))
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn cache_read_validates_against_time_after_await_not_request_start() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config())
+            .with_entrypoint(configure_delayed_cache);
+        let mut request = tester.request_partial(UnitHttpRequest::get());
+        assert!(matches!(request.poll(), std::task::Poll::Pending));
+        tester.sleep(Duration::from_millis(1010));
+        assert!(
+            matches!(request.poll(),std::task::Poll::Ready(response) if response.status_code() == 200)
+        );
+    }
+
+    struct PendingStorage {
+        stage: u64,
+        reads: std::cell::Cell<u64>,
+    }
+    impl pdk::data_storage::DataStorage for PendingStorage {
+        async fn get_keys(&self) -> Result<Vec<String>, pdk::data_storage::DataStorageError> {
+            Ok(Vec::new())
+        }
+        async fn store<T: serde::Serialize>(
+            &self,
+            _: &str,
+            _: &pdk::data_storage::StoreMode,
+            _: &T,
+        ) -> Result<(), pdk::data_storage::DataStorageError> {
+            if self.stage == 1 || self.stage == 2 {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+        async fn get<T: serde::de::DeserializeOwned>(
+            &self,
+            _: &str,
+        ) -> Result<Option<(T, String)>, pdk::data_storage::DataStorageError> {
+            self.reads.set(self.reads.get() + 1);
+            if self.stage == 0 || (self.stage == 3 && self.reads.get() > 1) {
+                std::future::pending().await
+            } else {
+                Ok(None)
+            }
+        }
+        async fn delete(&self, _: &str) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("never delete")
+        }
+        async fn delete_all(&self) -> Result<(), pdk::data_storage::DataStorageError> {
+            panic!("never delete")
+        }
+    }
+    async fn configure_pending_storage(
+        launcher: pdk::hl::Launcher,
+        pdk::hl::Configuration(bytes): pdk::hl::Configuration,
+        client: pdk::hl::HttpClient,
+        clock: pdk::hl::timer::Clock,
+        violations: pdk::policy_violation::PolicyViolations,
+    ) -> anyhow::Result<()> {
+        let config = super::parse_config(&bytes)?;
+        let input: Value = serde_json::from_slice(&bytes)?;
+        let stage = input["pendingStage"].as_u64().unwrap_or(0);
+        let rank_store = PendingStorage {
+            stage,
+            reads: std::cell::Cell::new(if stage == 3 { 1 } else { 0 }),
+        };
+        let lock_store = PendingStorage {
+            stage: if rank_store.stage == 1 { 1 } else { 4 },
+            reads: std::cell::Cell::new(0),
+        };
+        let timer = clock.period(Duration::from_millis(10));
+        if rank_store.stage >= 2 {
+            // pdk-unit's side-call driver advances a buffered body after HTTP even if a
+            // timer-only future is still pending. Exercise commit/CAS cancellation without HTTP.
+            let filter = pdk::hl::on_request(|request: pdk::hl::RequestState| async {
+                let state = request.into_headers_state().await;
+                let _ = state.handler().header(":path");
+                let value = cached(1, 0);
+                let result = super::within_deadline(
+                    super::write_cached_rank(&rank_store, "key", &value, || Some(0)),
+                    &timer,
+                )
+                .await;
+                assert!(result.is_none());
+                violations.generate_policy_violation();
+                pdk::hl::Flow::<super::ClassificationGateData>::Break(super::block_response(
+                    Some(json!(42)),
+                    None,
+                    &[],
+                    &config,
+                ))
+            });
+            return Ok(launcher.launch(filter).await?);
+        }
+        super::launch_policy(
+            launcher,
+            &config,
+            &client,
+            &rank_store,
+            &lock_store,
+            &timer,
+            &violations,
+        )
+        .await
+    }
+
+    #[test]
+    fn total_timer_deadline_cancels_cache_read_lock_write_commit_and_cas_read() {
+        for stage in 0..4 {
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config_with(json!({"pendingStage":stage})))
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority(
+                    "cdgclogin",
+                    cdgc_login_backend(Rc::new(RefCell::new(0))),
+                )
+                .with_http_upstream_from_authority(
+                    "cdgcapi",
+                    single_column_backend(
+                        VISIT_REASON_COL,
+                        VISIT_REASON_CLS,
+                        "LOW",
+                        Rc::new(RefCell::new(0)),
+                        Rc::new(RefCell::new(0)),
+                    ),
+                )
+                .with_entrypoint(configure_pending_storage);
+            let mut request = tester.request_partial(mcp_request(42));
+            let first = request.poll();
+            assert!(
+                matches!(first, std::task::Poll::Pending),
+                "stage {stage}: {first:?}"
+            );
+            tester.sleep(Duration::from_millis(9990));
+            assert!(matches!(request.poll(), std::task::Poll::Pending));
+            tester.sleep(Duration::from_millis(20));
+            let response = match request.poll() {
+                std::task::Poll::Ready(response) => response,
+                _ => panic!("storage cannot exceed resolution deadline"),
+            };
+            assert_eq!(
+                response.header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("blocked")
+            );
+            assert!(response.violation().is_some());
+            assert!(backend.next().is_none());
+        }
+    }
+
+    #[test]
+    fn cdgc_auth_integrity_and_response_size_fail_closed_with_stale_cache() {
+        for (stage, bad) in [
+            ("Login", json!({"sessionId":{},"orgId":"org"}).to_string()),
+            (
+                "Login",
+                json!({"sessionId":"session\r\nINJECTED","orgId":"org"}).to_string(),
+            ),
+            ("Token", json!({"jwt_token":"TOKEN\nINJECTED"}).to_string()),
+            ("Token", json!({"jwt_token":""}).to_string()),
+            ("Login", " ".repeat(super::MAX_RESPONSE_BYTES + 1)),
+            ("Token", " ".repeat(super::MAX_RESPONSE_BYTES + 1)),
+            ("details", " ".repeat(super::MAX_RESPONSE_BYTES + 1)),
+        ] {
+            let invalid = Rc::new(RefCell::new(false));
+            let login_flag = Rc::clone(&invalid);
+            let details_flag = Rc::clone(&invalid);
+            let bad_login = bad.clone();
+            let good_login = cdgc_login_backend(Rc::new(RefCell::new(0)));
+            let good_details = single_column_backend(
+                VISIT_REASON_COL,
+                VISIT_REASON_CLS,
+                "LOW",
+                Rc::new(RefCell::new(0)),
+                Rc::new(RefCell::new(0)),
+            );
+            let backend = Rc::new(TraceBackend::new(|_| UnitHttpResponse::new(200)));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config())
+                .with_backend(Rc::clone(&backend))
+                .with_http_upstream_from_authority("cdgclogin", move |req: UnitHttpRequest| {
+                    if *login_flag.borrow()
+                        && req.header(":path").unwrap_or_default().contains(stage)
+                    {
+                        UnitHttpResponse::new(200).with_body(bad_login.clone())
+                    } else {
+                        good_login(req)
+                    }
+                })
+                .with_http_upstream_from_authority("cdgcapi", move |req| {
+                    if *details_flag.borrow() && stage == "details" {
+                        UnitHttpResponse::new(200).with_body(bad.clone())
+                    } else {
+                        good_details(req)
+                    }
+                })
+                .with_entrypoint(super::configure);
+            assert_eq!(
+                tester
+                    .request(mcp_request(1))
+                    .header(super::HEADER_CLASSIFICATION_STATUS),
+                Some("ok")
+            );
+            assert!(backend.next().is_some());
+            *invalid.borrow_mut() = true;
+            tester.sleep(Duration::from_secs(86401));
+            for id in [2, 3] {
+                let response = tester.request(mcp_request(id));
+                assert_eq!(
+                    response.header(super::HEADER_CLASSIFICATION_STATUS),
+                    Some("blocked")
+                );
+                assert!(backend.next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn observation_precision_and_timeout_budget_are_bounded() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            super::observation_timestamp(epoch + Duration::from_nanos(10)),
+            Some(10)
+        );
+        assert_eq!(
+            super::observation_timestamp(epoch + Duration::from_nanos(11)),
+            Some(11)
+        );
+        assert_eq!(
+            super::next_call_timeout(5000, 9999),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(super::next_call_timeout(5000, 10000), None);
+        assert_eq!(
+            super::next_call_timeout(5000, 0),
+            Some(Duration::from_millis(5000))
+        );
     }
 }

@@ -12,9 +12,13 @@ orientation layer; `dq-gate-policy/CLAUDE.md` / `AGENTS.md` hold the full engine
   security boundaries and release blockers; do not assume these changes apply to the other gates.
 - **`data-classification-policy`** -- gates the same traffic on the worst-case CDGC
   `core.sensitivity` (LOW=1/MEDIUM=2/HIGH=3) across a list of governed column ids vs.
-  `maxAllowedClassification`. Structurally mirrors `dq-gate-policy` (same DataStorage cache/lock
-  split, CAS writes, latency budget, request classification, rejection shapes); the CDGC side is a
-  two-hop batched read (column -> linked classifications -> their sensitivity, chunks of 5).
+  `maxAllowedClassification`. Its hardened implementation requires the exact relational Column
+  `systemAttributes['core.classType']`, uses two-hop batches of 5, v3 source/account/policy-scoped
+  state, CAS ordering, instance-local integrity quarantine, and a safe remote-storage adapter.
+  POST JSON/A2A JSON inspection has separate 1 MiB/10s body and 10s total-resolution bounds;
+  excluded transports and task-result retrieval remain ungated. See its README and
+  `data-classification-policy/docs/security-verification.md` for local evidence and production
+  risks; do not assume the sibling gates share these changes.
 - **`freshness-gate-policy`** -- gates the same traffic on one CDGC `RuleInstance`'s own
   `selfAttributes.value` (a freshness/SLA score), not an asset rollup: CDGC only populates the
   `dataQuality` rollup for Informatica-automated (`infa-producer.dq`) RuleInstances, so a

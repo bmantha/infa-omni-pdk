@@ -7,11 +7,17 @@ metadata:
     category: Quality of Service
     description: >-
       Gates MCP tool calls and A2A message-send invocations on the CDGC data-element
-      classifications (core.sensitivity: LOW/MEDIUM/HIGH) of one or more governed columns a
+      classifications (core.sensitivity: LOW/MEDIUM/HIGH) of one or more governed relational columns a
       route can return. The worst (highest-rank) classification across every governed column
       is compared against a per-route ceiling; the whole call is blocked, not redacted, when
       it is exceeded. Classifications are cached and refreshed lazily, so most requests are a
-      fast local read.
+      fast local read. Only POST application/json and application/a2a+json are inspected;
+      non-POST, non-JSON and gRPC transports are intentionally excluded. Deploy a separate
+      gRPC control if needed. JSON batches and malformed/deep JSON are rejected, not bypassed.
+       Requests are limited to 1 MiB and a 10s atomic body wait; resolution has a separate
+       10s total deadline including storage. Keep the gateway connection buffer at 1 MiB.
+       Explicit POST task cancel, subscribe and push-notification configuration routes are
+       control operations and pass through before JSON body validation, including empty bodies.
     metadata/capabilities/injectionPoint: inbound
     metadata/capabilities/assetTypes: mcp,a2a,a2a_v1
     metadata/interfaceScope: api,resource
@@ -32,6 +38,12 @@ spec:
       description: >-
         CDGC base API URL for this org, e.g. https://idmc-api.dmp-us.informaticacloud.com.
         Not reliably returned by the Login API response in all orgs — configure explicitly.
+    allowInsecureLocalServices:
+      type: boolean
+      default: false
+      description: >-
+        Explicit local-test-only opt-in for HTTP CDGC services. Production services must use
+        HTTPS with certificate validation. Never enable this for real credentials.
     cdgcOrgUsername:
       type: string
       description: IDMC service-account username used to authenticate to CDGC.
@@ -47,14 +59,21 @@ spec:
     governedColumnIds:
       type: string
       description: >-
-        Comma-separated list of internal CDGC column-asset IDs this policy instance evaluates
+        Comma-separated list of internal CDGC relational Column asset IDs this policy instance evaluates
         for every gated call (same ID shown in the CDGC UI's asset URL for each column). A
         route commonly returns more than one classified column in a single tool call, so this
         is a list rather than dq-gate-policy's single fixed cdgcAssetId. Evaluation reads each
         column's linked classification(s) and takes the worst-case rank across the WHOLE list
         — see maxAllowedClassification — then blocks or allows the entire call; there is no
-        per-column redaction. A column with no linked classification is treated as
-        unclassified (rank 0) and never contributes to a block on its own.
+        per-column redaction. Hop 1 requests segments=summary,systemAttributes,dataClassification.
+        Only systemAttributes['core.classType'] equal to com.infa.odin.models.relational.Column
+        is supported; tables, ViewColumn and all other or missing class types are unknown,
+        never unclassified. No suffix or name-based type inference is performed.
+        A validated Column with a meaningful summary.core.name and no dataClassification key
+        or an empty classification list is unclassified (rank 0).
+        Identity-only responses are unknown. At most 32 distinct columns, each ID at most
+        256 bytes; each column may link at most 32 classifications (256 distinct overall).
+        Summary names are limited to 128 bytes and may not contain control characters.
     maxAllowedClassification:
       type: string
       default: MEDIUM
@@ -87,7 +106,16 @@ spec:
         result exists, keep serving it when true (fail-open on cache). If false, treat the
         failure as unknown and apply blockOnUnknownClassification instead. Orthogonal to
         blockOnUnknownClassification: this governs known-instance transient errors; that
-        governs the no-result-at-all case.
+        governs the no-result-at-all case. Malformed responses, missing identities or
+        sensitivity, missing or wrong relational Column class type, duplicate IDs and unknown tiers
+        always become unknown, never stale-cache
+         fallback. Strict mode also refuses stale cache on lock contention or storage failure.
+         Fallback rereads the current stored winner rather than reusing the initial snapshot.
+         Integrity failures quarantine this instance's cache key before any storage write;
+         failed or canceled invalidation cannot reenable its old allow result. Only a validated,
+         committed refresh clears quarantine. Invalid/future cache entries are unknown until a
+         validated refresh CAS-replaces them. Quarantine is bounded and instance-local, not a
+         cross-replica fail-closed guarantee if invalidation persistence fails or gossip lags.
     blockOnUnknownClassification:
       type: boolean
       default: true
@@ -106,12 +134,13 @@ spec:
       default: false
       description: >-
         When true, disclose the worst-case classification tier, maxAllowedClassification, and
-        the offending column/classification ids to the MCP or A2A client — in the block
+        the offending column names to the MCP or A2A client — in the block
         message (A2A v1.0: in the ErrorInfo metadata) and via the
         x-classification-gate-rank response header (opt-in). When false (default,
         recommended), the client sees only a generic block message and the coarse
         x-classification-gate-status header (ok/blocked/skipped/unknown); the exact tier,
-        ceiling, and asset ids are logged server-side only.
+        ceiling, and names are logged server-side only. Reserved upstream detail headers
+        are stripped before any authorized policy-owned headers are added.
     distributed:
       type: boolean
       default: false
@@ -119,10 +148,16 @@ spec:
         Share the cached classification results and refresh lock across gateway replicas via
         gossip-replicated storage (requires shared storage configured on the gateway). When
         false (default), each replica keeps its own in-memory cache and refreshes
-        independently.
+        independently. Requires valid gateway sharedStorage baseUrl/service coordinates and
+         a registered shared storage service. A bounded adapter avoids SDK raw-response logging.
+         Versioned, policy-identity-scoped namespaces intentionally
+        invalidate pre-hardening and name-only persisted entries (v3 namespaces);
+        each source/account/column set has an opaque key.
     timeout:
       type: integer
       default: 5000
+      minimum: 1
+      maximum: 10000
       description: >-
         Per-call timeout in milliseconds for each CDGC HTTP request (Login, JWT, and every
         batched column/classification read). Because a cache-miss request performs all of
