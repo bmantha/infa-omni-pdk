@@ -2,7 +2,7 @@
 [package]
 name = "data_classification_policy"
 version = "1.0.1"
-rust-version = "1.88.0"
+rust-version = "1.89.0"
 edition = "2021"
 resolver = "2"
 
@@ -17,16 +17,23 @@ implementation_asset_id = "data-classification-policy-flex"
 # enable_stop_iteration: lets request_filter buffer request headers + body atomically via
 # into_headers_body_state(), so a blocked tools/call is never forwarded upstream (mirrors
 # dq-gate-policy's rationale -- see its src/lib.rs header comment).
-pdk = { version = "1.10.0", features = ["enable_stop_iteration"] }
+pdk = { version = "=1.10.0", default-features = false, features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 anyhow = "1.0"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+pdk-data-storage-lib = { version = "=1.10.0", features = ["ll"] }
+sha2 = { version = "0.10", default-features = false }
+base64 = "0.22"
+pdk-serde-fixint = "=1.11.0"
 
 [dev-dependencies]
-pdk-test = { version = "1.10.0" }
-pdk-unit = { version = "1.10.0", features = ["enable_stop_iteration"] }
-httpmock = "0.6"
-reqwest = { version = "0.11", features = ["json"] }
+pdk-test = { version = "=1.10.0" }
+pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental_local_mode", "experimental_logs"] }
+# The remote server in tests/common matches this exact client version.
+httpmock = { version = "=0.8.3", default-features = false, features = ["remote"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1.53.3", features = ["time"] }
 
 [lib]
 crate-type = ["cdylib"]

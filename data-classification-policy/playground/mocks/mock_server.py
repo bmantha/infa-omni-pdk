@@ -39,8 +39,7 @@ PORT = int(os.environ.get("PORT", "80"))
 
 # The six real demo columns from OCCE1B_CLINICNORTH_PATIENTINTAKE_RAW, seeded exactly as verified
 # live against the real CDGC org this session, EXCEPT VISIT_REASON: seeded with an empty list
-# (never an absent key, to keep this mock simple; the real CDGC API's actual "no dataClassification
-# key at all" shape is what src/lib.rs's own unit tests exercise directly) -- demo.sh's governance
+# (the response omits dataClassification for unclassified columns) -- demo.sh's governance
 # event links it to CLASSIFICATION_VISIT_REASON below via PUT /classification.
 COLUMN_ID_VISIT_REASON = "b7e13420-4841-4bbe-86c0-002b1d9af165"
 CLASSIFICATION_VISIT_REASON = "ceaa1ca4-764d-4458-abc8-146ffee68222"
@@ -73,6 +72,13 @@ PATIENT_RECORD = {
                     "improved mood on current sertraline dosage.",
     "checkInStatus": "CHECKED_IN",
 }
+
+COLUMN_NAMES = dict(zip(COLUMN_TO_CLASSIFICATIONS, [
+    "VISIT_REASON", "SSN", "DATE_OF_BIRTH", "PATIENT_ID", "FULL_NAME", "APPOINTMENT_DATE",
+]))
+CLASSIFICATION_NAMES = dict(zip(CLASSIFICATION_SENSITIVITY, [
+    "Clinical Visit Reason", "Social Security Number", "Date of Birth", "Patient Identifier", "Patient Full Name",
+]))
 
 
 def read_json(handler):
@@ -115,28 +121,31 @@ class CdgcLoginHandler(BaseHTTPRequestHandler):
 
 
 class CdgcApiHandler(BaseHTTPRequestHandler):
-    """Serves the CDGC batched details API's `dataClassification` and `summary,selfAttributes`
-    segments (5-id-per-call cap NOT enforced here -- this mock is for manual smoke testing, not
-    correctness proof; the 5-id cap is proven by src/lib.rs's own unit tests)."""
+    """Serves exact summary/systemAttributes/dataClassification and summary/selfAttributes contracts,
+    including the five-id cap. This local fixture does not verify a live catalog."""
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if not parsed.path.startswith("/data360/search/v1/assets/details"):
+        if parsed.path != "/data360/search/v1/assets/details":
             respond(self, 404, {"error": f"no such path: {self.path}"})
             return
 
         segments = parse_qs(parsed.query).get("segments", [""])[0]
         ids = read_json(self)
-        if not isinstance(ids, list):
-            respond(self, 400, {"message": "expected a JSON array of ids"})
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 5 or any(not isinstance(i, str) for i in ids):
+            respond(self, 400, {"message": "expected a JSON array of 1 to 5 string ids"})
             return
 
-        if segments == "dataClassification":
+        if segments == "summary,systemAttributes,dataClassification":
             results = []
             for column_id in ids:
                 if column_id not in COLUMN_TO_CLASSIFICATIONS:
                     continue  # unresolved id -> simply absent from the response
-                entry = {"core.identity": column_id}
+                entry = {
+                    "core.identity": column_id,
+                    "summary": {"core.name": COLUMN_NAMES[column_id]},
+                    "systemAttributes": {"core.classType": "com.infa.odin.models.relational.Column"},
+                }
                 classifications = COLUMN_TO_CLASSIFICATIONS[column_id]
                 if classifications:
                     entry["dataClassification"] = [{"core.identity": c} for c in classifications]
@@ -150,6 +159,7 @@ class CdgcApiHandler(BaseHTTPRequestHandler):
                     continue
                 results.append({
                     "core.identity": classification_id,
+                    "summary": {"core.name": CLASSIFICATION_NAMES[classification_id]},
                     "selfAttributes": {"core.sensitivity": CLASSIFICATION_SENSITIVITY[classification_id]},
                 })
             print(f"[cdgcapi] selfAttributes hop for {ids} -> {len(results)} resolved", flush=True)

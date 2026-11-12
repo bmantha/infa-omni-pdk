@@ -1,15 +1,22 @@
 # Copyright 2026 Salesforce, Inc. All rights reserved.
-version: "3.3"
-
 services:
   local-flex:
-    image: ${PDK_TEST_FLEX_IMAGE_NAME:-mulesoft/flex-gateway}:${PDK_TEST_FLEX_IMAGE_VERSION:-1.13.0}
+    platform: linux/amd64
+    image: mulesoft/flex-gateway:1.13.0@sha256:82d645f34e16554715dbd3b1bb2cbbfc304a3a8ea1264a64b7460fddc97b33fa
     ports:
-      - 8081:8081
+      - 127.0.0.1:8081:8081
     volumes:
-      - ./config:/usr/local/share/mulesoft/flex-gateway/conf.d/
+      - type: bind
+        source: ${CLASSIFICATION_API_CONFIG:-./config/api.yaml}
+        target: /usr/local/share/mulesoft/flex-gateway/conf.d/api.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./config/registration.yaml:/usr/local/share/mulesoft/flex-gateway/conf.d/registration.yaml:ro
+      - ./config/logging.yaml:/usr/local/share/mulesoft/flex-gateway/conf.d/logging.yaml:ro
+      - ./config/custom-policies:/usr/local/share/mulesoft/flex-gateway/conf.d/custom-policies:ro
   backend:
-    image: python:3.12-alpine
+    image: python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
     environment:
       ROLE: backend
       PORT: "80"
@@ -17,7 +24,7 @@ services:
       - ./mocks/mock_server.py:/mock_server.py:ro
     command: python /mock_server.py
   cdgclogin:
-    image: python:3.12-alpine
+    image: python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
     environment:
       ROLE: cdgclogin
       PORT: "80"
@@ -25,7 +32,7 @@ services:
       - ./mocks/mock_server.py:/mock_server.py:ro
     command: python /mock_server.py
   cdgcapi:
-    image: python:3.12-alpine
+    image: python:3.12-alpine@sha256:e064671ca452259bab50e8e2c7bd896e39e9a343bb06ca25234adf6fe18d0fc7
     environment:
       ROLE: cdgcapi
       PORT: "80"
