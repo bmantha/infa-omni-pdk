@@ -1,12 +1,4 @@
-target
-playground/config/custom-policies/*
-!playground/config/custom-policies/note.txt
-.pdk
-registration.yaml
-certificate.yaml
-.env
-.envrc
-playground/config/api.local.yaml
-playground/private/
-__pycache__/
-src/generated/.config-gen-*/
+# Moved to https://github.com/bmantha/data-classification-policy -- keep local leftovers (.env, target/, ...) out of git
+*
+!README.md
+!.gitignore
