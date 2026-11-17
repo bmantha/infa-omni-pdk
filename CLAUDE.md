@@ -10,14 +10,14 @@ orientation layer; the `dq-gate-policy` repo (https://github.com/bmantha/dq-gate
   telemetry, a Timer-enforced 10s total score-resolution deadline (including storage),
   gossip-distributed caching, and `discloseScoreDetails`. See `dq-gate-policy/docs/spec.md` for
   security boundaries and release blockers; do not assume these changes apply to the other gates.
-- **`data-classification-policy`** -- gates the same traffic on the worst-case CDGC
+- **`data-classification-policy`** (own repo: https://github.com/bmantha/data-classification-policy; the folder here is only a pointer) -- gates the same traffic on the worst-case CDGC
   `core.sensitivity` (LOW=1/MEDIUM=2/HIGH=3) across a list of governed column ids vs.
   `maxAllowedClassification`. Its hardened implementation requires the exact relational Column
   `systemAttributes['core.classType']`, uses two-hop batches of 5, v3 source/account/policy-scoped
   state, CAS ordering, instance-local integrity quarantine, and a safe remote-storage adapter.
   POST JSON/A2A JSON inspection has separate 1 MiB/10s body and 10s total-resolution bounds;
   excluded transports and task-result retrieval remain ungated. See its README and
-  `data-classification-policy/docs/security-verification.md` for local evidence and production
+  `docs/security-verification.md` in the data-classification-policy repo for local evidence and production
   risks; do not assume the sibling gates share these changes.
 - **`freshness-gate-policy`** -- gates the same traffic on one CDGC `RuleInstance`'s own
   `selfAttributes.value` (a freshness/SLA score), not an asset rollup: CDGC only populates the

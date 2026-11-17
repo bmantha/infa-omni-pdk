@@ -9,7 +9,7 @@ Informatica IDMC **CDGC**. Each policy is a self-contained Rust / `wasm32-wasip1
 | Policy | Gates on | MCP block | A2A JSON-RPC block | A2A REST block |
 |---|---|---|---|---|
 | [`dq-gate-policy`](https://github.com/bmantha/dq-gate-policy) (own repo) | A CDGC asset's data-quality rollup score vs. warn/block thresholds | `-32008` | `-32010` | HTTP 403 |
-| [`data-classification-policy`](data-classification-policy/) | Worst-case `core.sensitivity` (LOW/MEDIUM/HIGH) across a list of governed columns vs. a ceiling | `-32011` | `-32012` | HTTP 403 |
+| [`data-classification-policy`](https://github.com/bmantha/data-classification-policy) (own repo) | Worst-case `core.sensitivity` (LOW/MEDIUM/HIGH) across a list of governed columns vs. a ceiling | `-32011` | `-32012` | HTTP 403 |
 | [`freshness-gate-policy`](freshness-gate-policy/) | A single CDGC RuleInstance's own freshness/SLA `value` vs. warn/block thresholds | `-32013` | `-32014` | HTTP 403 |
 
 All three share the same runtime design: CDGC results are cached in PDK `DataStorage` (local, or
@@ -20,7 +20,7 @@ methods (`initialize`, `tools/list`, A2A task queries, ...) pass through ungated
 ## Working on a policy
 
 ```bash
-cd data-classification-policy   # or freshness-gate-policy (dq-gate-policy lives in its own repo)
+cd freshness-gate-policy   # dq-gate-policy and data-classification-policy live in their own repos
 make setup                     # once: cargo-anypoint + llvm-cov
 make build                     # definition + wasm implementation
 cargo test --lib               # unit tests
