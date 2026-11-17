@@ -1,8 +1,4 @@
-target
-playground/config/custom-policies/*
-!playground/config/custom-policies/note.txt
-.pdk
-registration.yaml
-certificate.yaml
-.env
-.envrc
+# Moved to https://github.com/bmantha/dq-gate-policy -- keep local leftovers (.env, target/, ...) out of git
+*
+!README.md
+!.gitignore
