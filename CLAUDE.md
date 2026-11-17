@@ -2,9 +2,9 @@
 
 Monorepo of MuleSoft Flex Gateway PDK policies. Each folder is a self-contained Rust/wasm32-wasip1
 crate -- run `make`/`cargo` from inside the folder, not the repo root. This file is only the
-orientation layer; `dq-gate-policy/CLAUDE.md` / `AGENTS.md` hold the full engineering detail.
+orientation layer; the `dq-gate-policy` repo (https://github.com/bmantha/dq-gate-policy, its `CLAUDE.md` / `AGENTS.md`) holds the full engineering detail.
 
-- **`dq-gate-policy`** -- gates MCP tool calls / A2A message-send on a CDGC asset's `dataQuality`
+- **`dq-gate-policy`** (own repo: https://github.com/bmantha/dq-gate-policy; the folder here is only a pointer) -- gates MCP tool calls / A2A message-send on a CDGC asset's `dataQuality`
   rollup score (`scoreAggregation: min|average`, warn/block thresholds). The reference
   implementation: fail-closed-by-default posture, A2A v0.3/v1.0 (JSON-RPC + REST), `PolicyViolations`
   telemetry, a Timer-enforced 10s total score-resolution deadline (including storage),
